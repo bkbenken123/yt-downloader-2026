@@ -2526,6 +2526,14 @@ class Worker(threading.Thread):
         finally:
             self.proc = None
 
+    def _use_ytdlp_video_native(self) -> bool:
+        """yt-dlp can natively download/merge to mp4 when nothing needs transcoding."""
+        return (
+            str(self.opts.get("container") or "").lower().lstrip(".") == "mp4"
+            and self.opts.get("video_codec") == "copy"
+            and self.opts.get("audio_codec") == "copy"
+        )
+
     def _run_yt_dlp_subprocess(self, outtmpl: str, mode: str) -> bool:
         command = get_ytdlp_command()
         if not command:
@@ -2567,7 +2575,16 @@ class Worker(threading.Thread):
                     f"yt-dlp audio post-processing enabled: --audio-format {audio_format}",
                 ))
         else:
-            cmd += ["-f", "bestvideo+bestaudio/best", "--merge-output-format", "mkv"]
+            if self._use_ytdlp_video_native():
+                merge_format = str(self.opts.get("container") or "mp4").lower().lstrip(".")
+                cmd += ["-f", "bestvideo+bestaudio/best", "--merge-output-format", merge_format]
+                self.q.put((
+                    "log",
+                    f"yt-dlp native video processing enabled: "
+                    f"--merge-output-format {merge_format} (copy/copy, no FFmpeg pass)",
+                ))
+            else:
+                cmd += ["-f", "bestvideo+bestaudio/best", "--merge-output-format", "mkv"]
 
         self.q.put(("log", f"Starting yt-dlp: {command_text(cmd)}"))
 
@@ -2932,8 +2949,8 @@ class Worker(threading.Thread):
         )
         return False
 
-    def _finalize_ytdlp_audio(self, src: str, dst: str) -> bool:
-        """Move yt-dlp's already post-processed audio file to its final name."""
+    def _finalize_ytdlp_output(self, src: str, dst: str, label: str = "output") -> bool:
+        """Move a yt-dlp-produced file (audio or video) to its final name."""
         src_abs = os.path.abspath(src)
         dst_abs = os.path.abspath(dst)
 
@@ -2945,14 +2962,17 @@ class Worker(threading.Thread):
                 os.remove(dst_abs)
             os.replace(src_abs, dst_abs)
         except OSError as exc:
-            self.q.put(("error", f"Could not finalize yt-dlp audio output: {exc}"))
+            self.q.put(("error", f"Could not finalize yt-dlp {label}: {exc}"))
             return False
 
         if not os.path.isfile(dst_abs) or os.path.getsize(dst_abs) <= 0:
-            self.q.put(("error", f"yt-dlp audio output is missing or empty: {dst_abs}"))
+            self.q.put(("error", f"yt-dlp {label} is missing or empty: {dst_abs}"))
             return False
 
-        self.q.put(("log", f"yt-dlp audio finalized without a second FFmpeg conversion: {dst_abs}"))
+        self.q.put((
+            "log",
+            f"yt-dlp {label} finalized without a second FFmpeg conversion: {dst_abs}",
+        ))
         return True
 
     def _convert_audio(
@@ -3089,7 +3109,10 @@ class Worker(threading.Thread):
             and self.opts.get("use_ytdlp_audio_conversion", True)
             and str(self.opts.get("container") or "").lower().lstrip(".") == "mp3"
         )
-        if use_ytdlp_audio:
+        use_ytdlp_video = (mode == "video" and self._use_ytdlp_video_native())
+        use_ytdlp_native = use_ytdlp_audio or use_ytdlp_video
+
+        if use_ytdlp_native:
             target_extension = "." + str(self.opts["container"]).lower().lstrip(".")
             candidates = [
                 path
@@ -3104,6 +3127,12 @@ class Worker(threading.Thread):
                     f"Link {index}/{total}: yt-dlp did not create the requested "
                     f"{self.opts['container']} audio file.",
                 ))
+            elif use_ytdlp_video:
+                self.q.put((
+                    "error",
+                    f"Link {index}/{total}: yt-dlp did not create the requested "
+                    f"{self.opts['container']} video file.",
+                ))
             else:
                 self.q.put(("error", f"Link {index}/{total}: no newly downloaded intermediate file was found."))
             return False, out_folder
@@ -3112,9 +3141,10 @@ class Worker(threading.Thread):
         successful_pairs: list[tuple[str, str]] = []
         for src in candidates:
             final = build_final_path(src, self.opts["container"])
-            if use_ytdlp_audio:
-                self.q.put(("log", f"Finalizing yt-dlp audio: {src} -> {final}"))
-                converted = self._finalize_ytdlp_audio(src, final)
+            if use_ytdlp_native:
+                kind = "audio" if use_ytdlp_audio else "video"
+                self.q.put(("log", f"Finalizing yt-dlp {kind}: {src} -> {final}"))
+                converted = self._finalize_ytdlp_output(src, final, kind)
             else:
                 self.q.put(("log", f"Converting: {src} -> {final}"))
                 converted = self._ffmpeg_convert(
