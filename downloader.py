@@ -6,6 +6,7 @@ import json
 import os
 import queue
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -102,6 +103,31 @@ VIDEO_CODECS = [
 VIDEO_CONTAINERS = ["mp4", "mkv", "webm", "mov"]
 AUDIO_CONTAINERS = ["mp3", "m4a", "wav", "flac", "opus"]
 THUMBNAIL_CONTAINERS = ["jpg", "png", "webp"]
+
+# Which video codecs each video container actually accepts.
+VIDEO_CODEC_CONTAINER_COMPAT = {
+    "mp4":  {"copy", "h264", "h265", "vp9", "av1"},
+    "mkv":  set(VIDEO_CODECS),
+    "webm": {"copy", "vp9", "av1"},
+    "mov":  {"copy", "h264", "h265", "av1", "prores_422", "dnxhr_sq", "dnxhr_hq"},
+}
+
+# Which audio codecs each video container accepts.
+AUDIO_CODEC_VIDEO_CONTAINER_COMPAT = {
+    "mp4":  {"copy", "aac", "flac", "lpcm", "mpeg-1", "mpeg-2"},
+    "mkv":  set(AUDIO_CODECS),
+    "webm": {"copy", "opus"},
+    "mov":  {"copy", "aac", "flac", "lpcm", "mpeg-1", "mpeg-2"},
+}
+
+# Which audio codecs each audio-only container accepts.
+AUDIO_CODEC_AUDIO_CONTAINER_COMPAT = {
+    "mp3":  {"copy", "mpeg-1"},
+    "m4a":  {"copy", "aac"},
+    "wav":  {"copy", "lpcm"},
+    "flac": {"copy", "flac"},
+    "opus": {"copy", "opus"},
+}
 
 GPU_ENCODER_CANDIDATES = {
     # Windows mappings. Linux adds VAAPI vendor-specific alternatives at runtime.
@@ -402,17 +428,16 @@ def find_ytdlp_executable() -> Optional[str]:
     """Resolve a prebuilt yt-dlp executable when one is available."""
     if sys.platform.startswith("linux"):
         path = os.path.join(BINARIES_DIR, "yt-dlp_linux")
-        if not os.path.isfile(path):
-            return None
-
-        if not os.access(path, os.X_OK):
-            try:
-                current_mode = os.stat(path).st_mode
-                os.chmod(path, current_mode | 0o100)
-            except OSError:
-                return None
-
-        return os.path.abspath(path)
+        if os.path.isfile(path):
+            if not os.access(path, os.X_OK):
+                try:
+                    current_mode = os.stat(path).st_mode
+                    os.chmod(path, current_mode | 0o100)
+                except OSError:
+                    return None
+            return os.path.abspath(path)
+        # Fall back to a yt-dlp already on PATH.
+        return find_local_executable(["yt-dlp", "yt_dlp"])
 
     # Also accept a locally built PyInstaller executable inside the cloned repo.
     repo_candidates = [
@@ -437,7 +462,9 @@ def is_playlist_info(info: object) -> bool:
 
 def command_text(cmd: list[str]) -> str:
     """Format a command for logs without changing what is executed."""
-    return subprocess.list2cmdline([str(part) for part in cmd])
+    if sys.platform == "win32":
+        return subprocess.list2cmdline([str(part) for part in cmd])
+    return shlex.join([str(part) for part in cmd])
 
 
 def get_ytdlp_command() -> Optional[list[str]]:
@@ -450,10 +477,12 @@ def get_ytdlp_command() -> Optional[list[str]]:
     if executable:
         return [executable]
 
-    # Linux keeps its historical bundled-binary/source-checkout rule.
-    if sys.platform.startswith("linux"):
-        return None
+    # Try system yt-dlp on PATH on any platform.
+    system_ytdlp = shutil.which("yt-dlp")
+    if system_ytdlp:
+        return [system_ytdlp]
 
+    # Try python -m yt_dlp on any platform.
     try:
         proc = subprocess.run(
             [sys.executable, "-m", "yt_dlp", "--version"],
@@ -1895,11 +1924,17 @@ def ensure_ffmpeg_ready(log, force_rebuild: bool = False) -> bool:
     ffprobe = find_ffmpeg_executable("ffprobe")
     if ffmpeg and ffprobe:
         runtime_ok, runtime_error = _verify_ffmpeg_runtime(ffmpeg, ffprobe)
-        if runtime_ok:
-            log(f"Using existing FFmpeg installation: {ffmpeg}")
-            return True
-        log(f"ERROR: Existing FFmpeg installation could not start: {runtime_error}")
-        return False
+        if not runtime_ok:
+            log(f"ERROR: Existing FFmpeg installation could not start: {runtime_error}")
+            return False
+
+        encoders_ok, encoders_error = _verify_ffmpeg_required_encoders(ffmpeg)
+        if not encoders_ok:
+            log(f"ERROR: Existing FFmpeg installation is missing a required codec: {encoders_error}")
+            return False
+
+        log(f"Using existing FFmpeg installation: {ffmpeg}")
+        return True
 
     log(
         f"ERROR: No FFmpeg source checkout was found at {FFMPEG_SOURCE_DIR}, "
@@ -1957,19 +1992,7 @@ def update_ytdlp_installation() -> tuple[bool, list[str]]:
             command = get_ytdlp_command()
             return command is not None, messages
 
-        if sys.platform.startswith("linux"):
-            messages.append(
-                "Bundled yt-dlp_linux could not update itself; the existing binary will be used."
-            )
-            return get_ytdlp_command() is not None, messages
-
         messages.append("Standalone update did not succeed; trying pip.")
-
-    if sys.platform.startswith("linux"):
-        messages.append(
-            "Missing binaries/yt-dlp source checkout or binaries/yt-dlp_linux."
-        )
-        return False, messages
 
     pip_base = [
         sys.executable,
@@ -2020,6 +2043,11 @@ def parse_ffmpeg_component_names(output: str) -> set[str]:
 
         flags = parts[0]
         name = parts[1]
+
+        # Skip header separator rows like "V..... = Video".
+        if name == "=":
+            continue
+
         if re.fullmatch(r"[A-Z\.]{6,8}", flags, re.IGNORECASE):
             names.add(name.lower())
 
@@ -2457,9 +2485,17 @@ class Worker(threading.Thread):
             labels = [GPU_ENCODER_LABELS.get(item, item) for item in compiled]
             self.q.put(("log", f"Compiled {backend} encoder(s) for {selected_codec}: {', '.join(labels)}"))
         elif mapped:
-            self.q.put(("log", f"No compiled {backend} encoder was found for {selected_codec}."))
+            self.q.put((
+                "log",
+                f"No compiled {backend} encoder was found for {selected_codec}. "
+                "The job will fall back to CPU encoding for this codec.",
+            ))
         else:
-            self.q.put(("log", f"{selected_codec} has no {backend} hardware encoder mapping."))
+            self.q.put((
+                "log",
+                f"{selected_codec} has no {backend} hardware encoder mapping. "
+                "The job will fall back to CPU encoding for this codec.",
+            ))
 
     def _get_playlist_title(self, url: str) -> Optional[str]:
         if not self.opts.get("download_playlist", True):
@@ -2527,10 +2563,9 @@ class Worker(threading.Thread):
             self.proc = None
 
     def _use_ytdlp_video_native(self) -> bool:
-        """yt-dlp can natively download/merge to mp4 when nothing needs transcoding."""
+        """yt-dlp can natively download/merge when no transcoding is needed."""
         return (
-            str(self.opts.get("container") or "").lower().lstrip(".") == "mp4"
-            and self.opts.get("video_codec") == "copy"
+            self.opts.get("video_codec") == "copy"
             and self.opts.get("audio_codec") == "copy"
         )
 
@@ -2644,17 +2679,26 @@ class Worker(threading.Thread):
         out_folder: str,
         before: dict[str, tuple[int, int]],
     ) -> list[str]:
-        candidates: list[str] = []
         after = snapshot_temp_files(out_folder)
-        for normalized, signature in after.items():
-            if before.get(normalized) == signature:
-                continue
-            # Recover the actual-cased path from the directory scan.
-            for name in os.listdir(out_folder):
-                path = os.path.abspath(os.path.join(out_folder, name))
-                if os.path.normcase(path) == normalized and os.path.isfile(path):
-                    candidates.append(path)
-                    break
+        changed_keys = {
+            normalized
+            for normalized, signature in after.items()
+            if before.get(normalized) != signature
+        }
+        if not changed_keys:
+            return []
+
+        try:
+            names = os.listdir(out_folder)
+        except OSError:
+            return []
+
+        candidates: list[str] = []
+        for name in names:
+            path = os.path.abspath(os.path.join(out_folder, name))
+            if os.path.normcase(path) in changed_keys and os.path.isfile(path):
+                candidates.append(path)
+
         return unique_existing_paths(candidates)
 
     def _audio_args(self, audio_codec: Optional[str], mode: str) -> list[str]:
@@ -2862,8 +2906,8 @@ class Worker(threading.Thread):
             self.q.put(("error", f"No encoder mapping exists for {video_codec}."))
             return False
 
-        if backend == "CPU":
-            self.q.put(("log", f"Forced CPU encoder for {video_codec}."))
+        def run_cpu_fallback(reason: str) -> bool:
+            self.q.put(("log", reason))
             cpu_cmd = [ffmpeg, "-y", "-nostdin", "-i", src]
             cpu_cmd += self._base_video_output_args(
                 dst=dst,
@@ -2874,30 +2918,26 @@ class Worker(threading.Thread):
             )
             return self._run_ffmpeg_attempt("CPU decode + CPU encode", cpu_cmd, dst)
 
-        mapped_encoders = gpu_encoder_candidates(video_codec, backend)
-        if not mapped_encoders:
-            self.q.put(
-                (
-                    "error",
-                    f"The selected {backend} backend is forced, but {video_codec} has no "
-                    f"{backend} hardware encoder mapping. Choose CPU or a codec supported "
-                    f"by {backend}. No other backend was used.",
-                )
-            )
-            return False
+        if backend == "CPU":
+            return run_cpu_fallback(f"Forced CPU encoder for {video_codec}.")
 
-        gpu_encoders = usable_gpu_encoders(video_codec, backend)
+        # GPU backend selected. Determine whether we have a usable GPU encoder.
+        mapped_encoders = gpu_encoder_candidates(video_codec, backend)
+        gpu_encoders = usable_gpu_encoders(video_codec, backend) if mapped_encoders else []
+
         if not gpu_encoders:
-            expected = ", ".join(mapped_encoders)
-            self.q.put(
-                (
-                    "error",
-                    f"The selected {backend} backend is forced, but FFmpeg does not contain "
-                    f"a usable encoder for {video_codec}. Expected: {expected}. "
-                    "No other GPU backend and no CPU fallback were used.",
+            if not mapped_encoders:
+                reason = (
+                    f"The selected {backend} backend has no hardware encoder mapping for "
+                    f"{video_codec}. Falling back to CPU encoding."
                 )
-            )
-            return False
+            else:
+                expected = ", ".join(mapped_encoders)
+                reason = (
+                    f"The selected {backend} backend does not have a usable encoder for "
+                    f"{video_codec} (expected: {expected}). Falling back to CPU encoding."
+                )
+            return run_cpu_fallback(reason)
 
         for encoder in gpu_encoders:
             label = GPU_ENCODER_LABELS.get(encoder, encoder)
@@ -2940,14 +2980,10 @@ class Worker(threading.Thread):
                 ):
                     return True
 
-        self.q.put(
-            (
-                "error",
-                f"Forced {backend} encoding failed for {video_codec}. "
-                "No other GPU backend and no CPU fallback were used.",
-            )
+        return run_cpu_fallback(
+            f"All {backend} GPU encoding attempts failed for {video_codec}. "
+            "Falling back to CPU encoding."
         )
-        return False
 
     def _finalize_ytdlp_output(self, src: str, dst: str, label: str = "output") -> bool:
         """Move a yt-dlp-produced file (audio or video) to its final name."""
@@ -3049,6 +3085,7 @@ class Worker(threading.Thread):
         source_abs = os.path.abspath(source)
         directory = os.path.dirname(final_abs)
         final_stem = os.path.splitext(os.path.basename(final_abs))[0]
+        temp_prefix = (final_stem + ".temp.").lower()
         removed: list[str] = []
 
         try:
@@ -3066,9 +3103,7 @@ class Worker(threading.Thread):
             # explicit `.temp.` marker inserted by this script. Do not remove
             # arbitrary similarly named media files.
             is_exact_source = os.path.normcase(path) == os.path.normcase(source_abs)
-            is_our_temp_file = (
-                filename.startswith(final_stem) and ".temp." in filename.lower()
-            )
+            is_our_temp_file = filename.lower().startswith(temp_prefix)
             if not (is_exact_source or is_our_temp_file):
                 continue
 
@@ -3589,13 +3624,20 @@ class App:
             menu.add_command(label=value, command=lambda item=value: choose(item))
 
     def _allowed_video_codecs(self, container: str) -> list[str]:
-        # Deliberately show the complete list. Compatibility is validated when
-        # Start is pressed instead of silently removing codecs from the menu.
-        return list(VIDEO_CODECS)
+        container = container.lower().lstrip(".")
+        allowed = VIDEO_CODEC_CONTAINER_COMPAT.get(container)
+        if allowed is None:
+            return list(VIDEO_CODECS)
+        return [codec for codec in VIDEO_CODECS if codec in allowed]
 
     def _allowed_audio_codecs(self, mode: str, container: str) -> list[str]:
-        if mode in ("video", "audio"):
-            return list(AUDIO_CODECS)
+        container = container.lower().lstrip(".")
+        if mode == "video":
+            allowed = AUDIO_CODEC_VIDEO_CONTAINER_COMPAT.get(container, set(AUDIO_CODECS))
+            return [codec for codec in AUDIO_CODECS if codec in allowed]
+        if mode == "audio":
+            allowed = AUDIO_CODEC_AUDIO_CONTAINER_COMPAT.get(container, set(AUDIO_CODECS))
+            return [codec for codec in AUDIO_CODECS if codec in allowed]
         return []
 
     def _ytdlp_supports_audio_container(self, container: str) -> bool:
@@ -3663,16 +3705,19 @@ class App:
 
     def on_container_change(self) -> None:
         mode = self.mode_var.get()
+        container = self.container_var.get().lower().lstrip(".")
+
         if mode == "video":
+            video_values = self._allowed_video_codecs(container)
             self._set_option_menu(
                 self.video_codec_dd,
                 self.video_codec_var,
-                list(VIDEO_CODECS),
+                video_values,
             )
-            if self.video_codec_var.get() not in VIDEO_CODECS:
+            if self.video_codec_var.get() not in video_values:
                 self.video_codec_var.set("copy")
 
-        audio_values = self._allowed_audio_codecs(mode, self.container_var.get().lower())
+        audio_values = self._allowed_audio_codecs(mode, container)
         if audio_values:
             self._set_option_menu(
                 self.audio_codec_dd,
@@ -3700,18 +3745,8 @@ class App:
             if audio not in AUDIO_CODECS:
                 return f"Unsupported audio codec: {audio}."
 
-            video_ok = {
-                "mp4": {"copy", "h264", "h265", "vp9", "av1"},
-                "mkv": set(VIDEO_CODECS),
-                "webm": {"copy", "vp9", "av1"},
-                "mov": {"copy", "h264", "h265", "av1", "prores_422", "dnxhr_sq", "dnxhr_hq"},
-            }
-            audio_ok = {
-                "mp4": {"copy", "aac", "flac", "lpcm", "mpeg-1", "mpeg-2"},
-                "mkv": set(AUDIO_CODECS),
-                "webm": {"copy", "opus"},
-                "mov": {"copy", "aac", "flac", "lpcm", "mpeg-1", "mpeg-2"},
-            }
+            video_ok = VIDEO_CODEC_CONTAINER_COMPAT
+            audio_ok = AUDIO_CODEC_VIDEO_CONTAINER_COMPAT
             if video not in video_ok[container]:
                 return (
                     f"Video codec '{video}' is not compatible with {container}. "
@@ -3721,19 +3756,6 @@ class App:
                 return (
                     f"Audio codec '{audio}' is not compatible with {container}. "
                     "Choose MKV or a compatible audio codec."
-                )
-
-            backend = self.settings["encoder_backend"]
-            if (
-                video != "copy"
-                and backend != "CPU"
-                and not gpu_encoder_candidates(video, backend)
-            ):
-                supported = ", ".join(hardware_supported_codecs(backend))
-                return (
-                    f"Video codec '{video}' is not supported by the forced {backend} "
-                    f"encoder backend. Supported hardware codecs: {supported}. "
-                    "Choose CPU in Settings to use the software encoder."
                 )
 
         elif mode == "audio":
@@ -3752,13 +3774,7 @@ class App:
             if audio not in AUDIO_CODECS:
                 return f"Unsupported audio codec: {audio}."
 
-            audio_ok = {
-                "mp3": {"copy", "mpeg-1"},
-                "m4a": {"copy", "aac"},
-                "wav": {"copy", "lpcm"},
-                "flac": {"copy", "flac"},
-                "opus": {"copy", "opus"},
-            }
+            audio_ok = AUDIO_CODEC_AUDIO_CONTAINER_COMPAT
             if audio not in audio_ok[container]:
                 recommended = {
                     "mp3": "mpeg-1",
