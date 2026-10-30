@@ -2,6 +2,8 @@
 #this script was made by bkbenken123
 from __future__ import annotations
 
+import base64
+import importlib
 import importlib.util
 import json
 import os
@@ -21,7 +23,7 @@ from typing import Iterable, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
-APP_VERSION = "2026.10.23.6"
+APP_VERSION = "2026.10.30.1"
 FFMPEG_BUILD_PROFILE = "all-vendors-win-linux-v5-required-codecs"
 AMD_PCI_VENDOR_ID = "0x1002"
 INTEL_PCI_VENDOR_ID = "0x8086"
@@ -558,6 +560,101 @@ def _run_update_command(
         return -1, "Update command timed out."
     except Exception as exc:
         return -1, str(exc)
+
+
+def ensure_mutagen_available() -> tuple[bool, list[str]]:
+    """Ensure Mutagen is installed for embedded cover art in Ogg Opus files."""
+    messages: list[str] = []
+    if _mutagen_available():
+        messages.append("Mutagen is available; Ogg Opus cover-art embedding is enabled.")
+        return True, messages
+
+    pip_base = [
+        sys.executable, "-m", "pip", "install", "--upgrade", "mutagen",
+        "--disable-pip-version-check",
+    ]
+    attempts = [pip_base]
+    if sys.prefix == getattr(sys, "base_prefix", sys.prefix):
+        attempts.append([*pip_base, "--user"])
+
+    for command in attempts:
+        code, output = _run_update_command(command, timeout=180)
+        messages.append(f"Mutagen dependency setup: {command_text(command)}")
+        if output:
+            messages.extend(line for line in output.splitlines() if line.strip())
+        importlib.invalidate_caches()
+        if code == 0 and _mutagen_available():
+            messages.append("Mutagen installed successfully; Ogg Opus cover-art embedding is enabled.")
+            return True, messages
+        if _mutagen_available():
+            messages.append("Mutagen is available; Ogg Opus cover-art embedding is enabled.")
+            return True, messages
+
+    messages.append(
+        "WARNING: Mutagen could not be installed. Opus audio will still be created, "
+        "but its cover image will be kept as a separate sidecar instead of being embedded."
+    )
+    return False, messages
+
+
+def embed_opus_cover_art(media_path: str, thumbnail_path: str) -> tuple[bool, str]:
+    """Embed JPEG/PNG artwork in an Ogg Opus file using METADATA_BLOCK_PICTURE."""
+    if not _mutagen_available():
+        return False, "Mutagen is not installed."
+    if not os.path.isfile(media_path) or not os.path.isfile(thumbnail_path):
+        return False, "The Opus file or cover image does not exist."
+
+    try:
+        from mutagen.flac import Picture
+        from mutagen.oggopus import OggOpus
+
+        with open(thumbnail_path, "rb") as handle:
+            image_data = handle.read()
+        if not image_data:
+            return False, "The cover image is empty."
+
+        if image_data.startswith(b"\xff\xd8\xff"):
+            mime = "image/jpeg"
+        elif image_data.startswith(b"\x89PNG\r\n\x1a\n"):
+            mime = "image/png"
+        elif image_data.startswith(b"RIFF") and image_data[8:12] == b"WEBP":
+            mime = "image/webp"
+        else:
+            suffix = os.path.splitext(thumbnail_path)[1].lower()
+            mime = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}.get(suffix)
+            if not mime:
+                return False, "The cover image is not a recognized JPEG, PNG, or WebP file."
+
+        image_info = probe_input_video(thumbnail_path)
+        try:
+            width = int(image_info.get("width") or 0)
+            height = int(image_info.get("height") or 0)
+        except (TypeError, ValueError):
+            width = height = 0
+
+        picture = Picture()
+        picture.type = 3  # Front cover.
+        picture.mime = mime
+        picture.desc = "Cover (front)"
+        picture.width = width
+        picture.height = height
+        picture.depth = 24 if mime != "image/png" else 32
+        picture.colors = 0
+        picture.data = image_data
+
+        audio = OggOpus(media_path)
+        if audio.tags is None:
+            audio.add_tags()
+        audio["METADATA_BLOCK_PICTURE"] = [base64.b64encode(picture.write()).decode("ascii")]
+        audio.save()
+
+        # Reopen the file to verify the picture comment was actually written.
+        verified = OggOpus(media_path)
+        if not verified.get("METADATA_BLOCK_PICTURE"):
+            return False, "Mutagen saved the Opus file, but the picture tag could not be verified."
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
 
 
 def _run_streamed_process(
@@ -2225,6 +2322,8 @@ class Worker(threading.Thread):
         self.proc: Optional[subprocess.Popen] = None
         self.downloaded_files: list[str] = []
         self.ytdlp_reported_errors: list[str] = []
+        self.preserved_thumbnail_paths: set[str] = set()
+        self.last_opus_cover_embedding_succeeded = False
 
     def _log_capabilities(self) -> None:
         features = detect_ffmpeg_features()
@@ -2892,8 +2991,30 @@ class Worker(threading.Thread):
         extension = os.path.splitext(dst)[1].lower().lstrip(".")
         embed_thumb = bool(self.opts.get("embed_metadata", False)) \
             and extension in COVER_ART_AUDIO_CONTAINERS
+        opus_target = embed_thumb and extension == "opus"
+        opus_cover_path: Optional[str] = None
+        self.last_opus_cover_embedding_succeeded = False
+
         cmd = [ffmpeg, "-y", "-nostdin", "-i", src]
-        if embed_thumb:
+        if opus_target:
+            # Ogg Opus does not mux a JPEG as an attached video stream. Keep the
+            # audio-only remux/transcode here, then write the cover into the
+            # Vorbis-comment METADATA_BLOCK_PICTURE field with Mutagen below.
+            cmd += ["-map", "0:a:0?", "-vn"]
+            if thumbnail_path and os.path.isfile(thumbnail_path):
+                opus_cover_path = thumbnail_path
+                self.q.put((
+                    "log",
+                    "Ogg Opus cover art will be embedded as METADATA_BLOCK_PICTURE; "
+                    "FFmpeg will only process the audio stream.",
+                ))
+            else:
+                self.q.put((
+                    "log",
+                    f"No external cover image was available for {os.path.basename(src)}; "
+                    "the Opus audio will be written without replacing any existing picture tags.",
+                ))
+        elif embed_thumb:
             # An explicitly supplied sidecar is the caller's chosen artwork and
             # must override an existing embedded cover when replacing thumbnails.
             if thumbnail_path and os.path.isfile(thumbnail_path):
@@ -2907,9 +3028,9 @@ class Worker(threading.Thread):
                 thumb_index = probe_input_thumbnail_stream(src)
                 if thumb_index is not None:
                     cmd += ["-map", "0:a:0?", "-map", f"0:{thumb_index}"]
-                    # mjpeg is accepted as APIC/PICTURE/covr in every audio container
-                    # we support; `copy` would fail if the source image is not a
-                    # format the target container accepts.
+                    # mjpeg is accepted as APIC/PICTURE/covr in the other audio
+                    # containers supported by this FFmpeg path. Ogg Opus is
+                    # intentionally handled by the Mutagen path above.
                     cmd += ["-c:v", "mjpeg", "-disposition:v", "attached_pic"]
                     if extension == "mp3":
                         cmd += ["-metadata:s:v", "title=Album cover",
@@ -2922,13 +3043,35 @@ class Worker(threading.Thread):
                     ))
         else:
             cmd += ["-map", "0:a:0?", "-vn"]
+
         cmd += ["-map_metadata", "0", "-map_metadata:s:a", "0:s:a"]
         if self.opts.get("embed_metadata", False):
             cmd += ["-map_chapters", "0"]
         cmd += self._resolved_audio_args(src, dst, audio_codec, "audio")
         cmd += self._muxer_args(dst, None)
         cmd += [dst]
-        return self._run_ffmpeg_attempt("Audio conversion", cmd, dst, expected_mode="audio")
+
+        converted = self._run_ffmpeg_attempt("Audio conversion", cmd, dst, expected_mode="audio")
+        if not converted:
+            return False
+
+        if opus_target and opus_cover_path:
+            embedded, error = embed_opus_cover_art(dst, opus_cover_path)
+            if embedded:
+                self.last_opus_cover_embedding_succeeded = True
+                self.q.put((
+                    "log",
+                    f"Embedded cover art in Ogg Opus METADATA_BLOCK_PICTURE: {dst}",
+                ))
+            else:
+                normalized = os.path.normcase(os.path.abspath(opus_cover_path))
+                self.preserved_thumbnail_paths.add(normalized)
+                self.q.put((
+                    "log",
+                    f"WARNING: Opus audio was created, but its cover could not be embedded ({error}). "
+                    f"The cover image will be kept beside the audio file: {opus_cover_path}",
+                ))
+        return True
 
     def _square_youtube_music_thumbnail(self, thumbnail_path: str) -> bool:
         """Crop a YouTube Music thumbnail to its centered square artwork.
@@ -3010,6 +3153,12 @@ class Worker(threading.Thread):
                 ffmpeg, media_path, temporary, "copy", thumbnail_path=thumbnail_path,
             ):
                 return False
+            if os.path.splitext(media_path)[1].lower() == ".opus" and not self.last_opus_cover_embedding_succeeded:
+                self.q.put((
+                    "error",
+                    f"The existing Opus file was left unchanged because its corrected cover could not be embedded: {media_path}",
+                ))
+                return False
             if not os.path.isfile(temporary) or os.path.getsize(temporary) <= 0:
                 self.q.put(("error", f"Cover-art remux did not create a valid file for {media_path}"))
                 return False
@@ -3068,12 +3217,23 @@ class Worker(threading.Thread):
         callers must only pass thumbnail paths identified as created/changed by this run.
         """
         removed: list[str] = []
+        preserved: list[str] = []
+        preserved_keys = self.preserved_thumbnail_paths
         for path in unique_existing_paths(thumbnail_paths):
+            if os.path.normcase(os.path.abspath(path)) in preserved_keys:
+                preserved.append(path)
+                continue
             try:
                 os.remove(path)
                 removed.append(path)
             except OSError as exc:
                 self.q.put(("log", f"Could not remove temporary thumbnail {path}: {exc}"))
+        if preserved:
+            self.q.put((
+                "log",
+                "Kept cover sidecar(s) because Ogg Opus picture-tag embedding did not succeed: "
+                + ", ".join(preserved),
+            ))
         if removed:
             self.q.put((
                 "log",
@@ -3119,6 +3279,8 @@ class Worker(threading.Thread):
         self.url = url
         self.downloaded_files = []
         self.ytdlp_reported_errors = []
+        self.preserved_thumbnail_paths.clear()
+        self.last_opus_cover_embedding_succeeded = False
         out_folder = self.opts.get("outdir", os.path.expanduser("~/Downloads"))
         self.q.put(("log", f"=== Link {index}/{total}: {url} ==="))
         mode = self.opts["mode"]
@@ -3415,6 +3577,19 @@ class App:
         except Exception as exc:
             ytdlp_ready = False
             startup_log(f"ERROR: yt-dlp startup preparation failed: {exc}")
+
+        try:
+            startup_log("Checking Mutagen support for embedded Opus cover art...")
+            mutagen_ready, messages = ensure_mutagen_available()
+            for message in messages:
+                startup_log(message)
+        except Exception as exc:
+            mutagen_ready = False
+            startup_log(
+                "WARNING: Mutagen setup failed; Opus audio downloads can still complete, "
+                f"but cover images may remain as sidecars: {exc}"
+            )
+
         self.q.put(("startup_tools_done", ffmpeg_ready, ytdlp_ready))
 
     def _start_ffmpeg_update(self) -> None:
