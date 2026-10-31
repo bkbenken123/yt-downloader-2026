@@ -23,23 +23,6 @@ A lightweight desktop YouTube downloader built with **Python**, **yt-dlp**, **FF
 * FFmpeg
 * FFprobe
 
-### Binary Locations
-
-The application first looks for the required executables in the following directory:
-
-```
-project/
-│
-├── binaries/
-│   ├── ffmpeg.exe
-│   ├── ffprobe.exe
-│   └── yt-dlp.exe
-│
-└── downloader.py
-```
-
-If any binaries are not found locally, the application will search your system **PATH**.
-
 ---
 
 ## Installation
@@ -50,10 +33,6 @@ Run the application:
 
 ```bash
 python downloader.py
-```
-or
-```bash
-python downloader.pyw
 ```
 
 ---
