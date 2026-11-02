@@ -25,6 +25,7 @@ from urllib.parse import urlsplit, urlunsplit
 SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
 APP_VERSION = "2026.10.30.1"
 FFMPEG_BUILD_PROFILE = "all-vendors-win-linux-v5-required-codecs"
+WINDOWS_FFMPEG_BUILD_TOOLCHAIN: Optional[str] = None
 AMD_PCI_VENDOR_ID = "0x1002"
 INTEL_PCI_VENDOR_ID = "0x8086"
 NVIDIA_PCI_VENDOR_ID = "0x10de"
@@ -43,6 +44,7 @@ APP_SOURCE_DIR = SCRIPT_DIR
 YTDLP_GIT_URL = "https://github.com/yt-dlp/yt-dlp.git"
 DEPENDENCIES_DIR = os.path.join(BINARIES_DIR, "dependencies")
 AMF_SOURCE_DIR = os.path.join(DEPENDENCIES_DIR, "AMF")
+LAME_SOURCE_DIR = os.path.join(DEPENDENCIES_DIR, "LAME")
 NV_CODEC_HEADERS_DIR = os.path.join(DEPENDENCIES_DIR, "nv-codec-headers")
 LIBVPL_SOURCE_DIR = os.path.join(DEPENDENCIES_DIR, "libvpl")
 LIBVPL_BUILD_DIR = os.path.join(DEPENDENCIES_DIR, "libvpl-build")
@@ -766,9 +768,262 @@ def _find_windows_msys2() -> tuple[Optional[str], Optional[str], Optional[str]]:
             toolchain_bin = os.path.join(root, subdir, "bin")
             if any(os.path.isfile(os.path.join(toolchain_bin, item)) for item in compiler_names):
                 return os.path.abspath(bash), os.path.abspath(toolchain_bin), msystem
-    if path_bash:
-        return os.path.abspath(path_bash), None, None
+    # Preserve custom MSYS2 layouts that expose GCC/Clang on PATH, but do not
+    # mistake an ordinary Git Bash installation for an MSYS2 build toolchain.
+    if path_bash and re.search(r"(?i)\\msys(?:32|64|2)?\\", os.path.normpath(path_bash)):
+        if shutil.which("gcc") or shutil.which("clang"):
+            return os.path.abspath(path_bash), None, None
     return None, None, None
+
+
+def _windows_ffmpeg_toolchain_preference() -> str:
+    requested = os.environ.get("DOWNLOADER_FFMPEG_TOOLCHAIN", "auto").strip().lower()
+    return requested if requested in {"auto", "msvc", "msys2"} else "invalid"
+
+def _find_windows_msvc_environment(log=None) -> Optional[dict[str, str]]:
+    """Return a fully initialized x64 MSVC environment, loading vcvars if needed."""
+    env = os.environ.copy()
+    existing_tools = all(
+        shutil.which(name, path=env.get("PATH"))
+        for name in ("cl.exe", "link.exe", "nmake.exe")
+    )
+    target_arch = env.get("VSCMD_ARG_TGT_ARCH", "").strip().lower()
+    compiler_path = shutil.which("cl.exe", path=env.get("PATH")) or ""
+    compiler_is_x64 = bool(re.search(r"(?i)\\Host(?:x64|x86)\\x64\\", compiler_path))
+    if existing_tools and (target_arch in {"x64", "amd64"} or compiler_is_x64):
+        return env
+
+    program_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+    vswhere_candidates = [
+        os.path.join(program_files_x86, "Microsoft Visual Studio", "Installer", "vswhere.exe"),
+    ]
+    vswhere = next((item for item in vswhere_candidates if os.path.isfile(item)), None)
+    installations: list[str] = []
+    if vswhere:
+        try:
+            result = subprocess.run(
+                [vswhere, "-latest", "-products", "*", "-requires",
+                 "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=15, check=False,
+            )
+            if result.returncode == 0:
+                installations.extend(line.strip() for line in result.stdout.splitlines() if line.strip())
+        except Exception:
+            pass
+
+    for key in ("VSINSTALLDIR",):
+        value = os.environ.get(key)
+        if value:
+            installations.append(value)
+    vc_install = os.environ.get("VCINSTALLDIR")
+    if vc_install:
+        installations.append(os.path.dirname(os.path.normpath(vc_install)))
+
+    for year in ("2022", "2019"):
+        for edition in ("BuildTools", "Community", "Professional", "Enterprise"):
+            installations.append(os.path.join(
+                os.environ.get("ProgramFiles", r"C:\Program Files"),
+                "Microsoft Visual Studio", year, edition,
+            ))
+
+    seen: set[str] = set()
+    vcvars_candidates: list[str] = []
+    for installation in installations:
+        normalized = os.path.normcase(os.path.abspath(installation))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        if os.path.basename(normalized).lower() == "vc":
+            candidate = os.path.join(installation, "Auxiliary", "Build", "vcvars64.bat")
+        else:
+            candidate = os.path.join(installation, "VC", "Auxiliary", "Build", "vcvars64.bat")
+        if os.path.isfile(candidate):
+            vcvars_candidates.append(candidate)
+
+    if not vcvars_candidates:
+        return None
+
+    cmd_exe = shutil.which("cmd.exe", path=env.get("PATH")) or os.path.join(
+        os.environ.get("SystemRoot", r"C:\Windows"), "System32", "cmd.exe"
+    )
+    for vcvars in vcvars_candidates:
+        batch_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".bat", prefix="downloader-vcvars-",
+                encoding="utf-8", newline="\r\n", delete=False,
+            ) as batch:
+                batch_path = batch.name
+                batch.write(f'@echo off\r\ncall "{vcvars}" >nul\r\n')
+                batch.write('if errorlevel 1 exit /b %errorlevel%\r\n')
+                batch.write("set\r\n")
+            result = subprocess.run(
+                [cmd_exe, "/d", "/c", batch_path], env=env,
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=60, check=False,
+            )
+            if result.returncode != 0:
+                continue
+            loaded = env.copy()
+            for line in result.stdout.splitlines():
+                key, separator, value = line.partition("=")
+                if separator and key and not key.startswith("="):
+                    loaded[key] = value
+            if all(shutil.which(name, path=loaded.get("PATH")) for name in ("cl.exe", "link.exe", "nmake.exe")):
+                if log:
+                    log(f"Loaded Visual Studio x64 build environment from: {vcvars}")
+                return loaded
+        except Exception as exc:
+            if log:
+                log(f"WARNING: Could not initialize the Visual Studio build environment: {exc}")
+        finally:
+            if batch_path:
+                try:
+                    os.remove(batch_path)
+                except OSError:
+                    pass
+    return None
+
+def _find_windows_non_msys_bash() -> tuple[Optional[str], Optional[str]]:
+    """Find Git Bash (or Cygwin Bash), deliberately excluding MSYS2."""
+    roots: list[str] = []
+    for value in (
+        os.environ.get("GIT_FOR_WINDOWS_HOME"),
+        r"C:\Program Files\Git",
+        r"C:\Program Files (x86)\Git",
+        r"C:\tools\Git",
+        r"C:\cygwin64",
+    ):
+        if value and value not in roots:
+            roots.append(value)
+    bash_candidates: list[tuple[str, str]] = []
+    for root in roots:
+        for relative in (os.path.join("bin", "bash.exe"), os.path.join("usr", "bin", "bash.exe"),
+                         os.path.join("bin", "bash")):
+            candidate = os.path.join(root, relative)
+            if os.path.isfile(candidate):
+                bash_candidates.append((os.path.abspath(candidate), os.path.abspath(os.path.join(root, "usr", "bin"))))
+    path_bash = shutil.which("bash.exe") or shutil.which("bash")
+    if path_bash and not re.search(r"(?i)\\msys(?:32|64|2)?\\", os.path.normpath(path_bash)):
+        normalized_bash = os.path.normpath(path_bash)
+        if re.search(r"(?i)\\usr\\bin\\bash(?:\.exe)?$", normalized_bash):
+            root = os.path.dirname(os.path.dirname(os.path.dirname(normalized_bash)))
+            usr_bin = os.path.dirname(normalized_bash)
+        else:
+            root = os.path.dirname(os.path.dirname(normalized_bash))
+            usr_bin = os.path.join(root, "usr", "bin")
+        bash_candidates.append((os.path.abspath(path_bash), os.path.abspath(usr_bin)))
+    for bash, usr_bin in bash_candidates:
+        if re.search(r"(?i)\\msys(?:32|64|2)?\\", bash):
+            continue
+        return bash, usr_bin
+    return None, None
+
+def _find_windows_gnu_make(env: dict[str, str], git_usr_bin: Optional[str]) -> Optional[str]:
+    candidates: list[str] = []
+    explicit = os.environ.get("DOWNLOADER_GNU_MAKE")
+    if explicit:
+        candidates.append(explicit)
+    if git_usr_bin:
+        candidates.append(os.path.join(git_usr_bin, "make.exe"))
+    path = env.get("PATH", "")
+    for name in ("make.exe", "make"):
+        found = shutil.which(name, path=path)
+        if found:
+            candidates.append(found)
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not candidate:
+            continue
+        normalized = os.path.normcase(os.path.abspath(candidate))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        if not os.path.isfile(candidate):
+            continue
+        # The MSVC route must not silently depend on make installed under MSYS2.
+        if re.search(r"(?i)\\msys(?:32|64|2)?\\", os.path.normpath(candidate)):
+            continue
+        return os.path.abspath(candidate)
+    return None
+
+def _find_windows_msvc_build_tools(log=None) -> Optional[tuple[str, str, dict[str, str], str]]:
+    env = _find_windows_msvc_environment(log)
+    if not env:
+        return None
+    bash, git_usr_bin = _find_windows_non_msys_bash()
+    if not bash:
+        return None
+    make = _find_windows_gnu_make(env, git_usr_bin)
+    if not make:
+        return None
+    # Keep the Visual Studio linker ahead of Git Bash utilities: Git may ship
+    # a coreutils executable named link.exe which must not shadow MSVC LINK.
+    msvc_tool_dirs = []
+    for executable in ("cl.exe", "link.exe", "nmake.exe"):
+        found = shutil.which(executable, path=env.get("PATH"))
+        if found:
+            directory = os.path.dirname(found)
+            if directory not in msvc_tool_dirs:
+                msvc_tool_dirs.append(directory)
+    path_parts = msvc_tool_dirs + [os.path.dirname(make), git_usr_bin]
+    env["PATH"] = os.pathsep.join(
+        [part for part in path_parts if part] + [env.get("PATH", "")]
+    )
+    if not all(shutil.which(name, path=env.get("PATH")) for name in ("cl.exe", "link.exe", "nmake.exe")):
+        return None
+    return bash, make, env, git_usr_bin
+
+def _prepare_msvc_lame(workspace: str, env: dict[str, str], log) -> Optional[tuple[str, str, str]]:
+    """Build a matching x64 LAME DLL/import library with the active MSVC toolchain."""
+    if not _prepare_git_dependency(
+        LAME_SOURCE_DIR, "https://github.com/lameproject/lame.git",
+        "Makefile.MSVC", "LAME MP3 encoder source", log,
+    ):
+        log("ERROR: Could not prepare the MSVC-compatible LAME source required for MP3 encoding.")
+        return None
+    nmake = shutil.which("nmake.exe", path=env.get("PATH")) or shutil.which("nmake", path=env.get("PATH"))
+    if not nmake:
+        log("ERROR: NMAKE was not found in the initialized Visual Studio environment.")
+        return None
+    log("Building the required LAME MP3 encoder with MSVC (x64, no external assembler)...")
+    command = [
+        nmake, "/nologo", "/f", "Makefile.MSVC", "libmp3lame.dll",
+        "MSVCVER=Win64", "MACHINE=/machine:X64", "ASM=NO",
+    ]
+    if _run_streamed_process(command, log, cwd=LAME_SOURCE_DIR, env=env) != 0:
+        log("ERROR: LAME could not be built with this MSVC toolset; MP3 encoding remains required by this application.")
+        return None
+
+    output_dir = os.path.join(LAME_SOURCE_DIR, "output")
+    header_candidates = (
+        os.path.join(LAME_SOURCE_DIR, "include", "lame", "lame.h"),
+        os.path.join(LAME_SOURCE_DIR, "include", "lame.h"),
+    )
+    header = next((item for item in header_candidates if os.path.isfile(item)), None)
+    import_library = os.path.join(output_dir, "libmp3lame.lib")
+    runtime_dll = os.path.join(output_dir, "libmp3lame.dll")
+    if not header or not os.path.isfile(import_library) or not os.path.isfile(runtime_dll):
+        log(
+            "ERROR: The MSVC LAME build did not produce its expected header, "
+            "libmp3lame.lib import library, and libmp3lame.dll runtime."
+        )
+        return None
+
+    staged_root = os.path.join(workspace, "_downloader_deps", "lame")
+    include_dir = os.path.join(staged_root, "include")
+    lib_dir = os.path.join(staged_root, "lib")
+    try:
+        os.makedirs(os.path.join(include_dir, "lame"), exist_ok=True)
+        os.makedirs(lib_dir, exist_ok=True)
+        shutil.copy2(header, os.path.join(include_dir, "lame", "lame.h"))
+        shutil.copy2(import_library, os.path.join(lib_dir, "libmp3lame.lib"))
+    except OSError as exc:
+        log(f"ERROR: Could not stage the MSVC LAME headers/library: {exc}")
+        return None
+    log("MSVC-compatible libmp3lame.lib and libmp3lame.dll are ready.")
+    return ("_downloader_deps/lame/include", "_downloader_deps/lame/lib", runtime_dll)
 
 
 def _git_checkout_ready(path: str, required_relpath: str) -> bool:
@@ -1070,37 +1325,64 @@ def _log_configure_failure_tail(path: Optional[str], log, max_lines: int = 80) -
         text = line.rstrip()
         if text:
             log(f"[configure.log] {text}")
-    log("--- end configure.log tail ---")
-
-
 def _build_ffmpeg_windows(log) -> bool:
-    bash, toolchain_bin, msystem = _find_windows_msys2()
-    if not bash:
+    global WINDOWS_FFMPEG_BUILD_TOOLCHAIN
+    preference = _windows_ffmpeg_toolchain_preference()
+    if preference == "invalid":
+        log("ERROR: DOWNLOADER_FFMPEG_TOOLCHAIN must be 'auto', 'msvc', or 'msys2'.")
+        return False
+
+    msvc_tools = _find_windows_msvc_build_tools(log) if preference in {"auto", "msvc"} else None
+    msys2_tools = _find_windows_msys2() if preference in {"auto", "msys2"} else (None, None, None)
+    if preference == "msvc":
+        if not msvc_tools:
+            log(
+                "ERROR: The MSVC build route needs Visual Studio 2019 16.8 or newer Build Tools, "
+                "Git for Windows Bash, and standalone GNU Make (not the MSYS2 copy). "
+                "Set DOWNLOADER_GNU_MAKE to make.exe when it is not on PATH."
+            )
+            return False
+        toolchain = "msvc"
+    elif preference == "msys2":
+        if not msys2_tools[0]:
+            log("ERROR: DOWNLOADER_FFMPEG_TOOLCHAIN is set to 'msys2', but an MSYS2 build environment was not found.")
+            return False
+        toolchain = "msys2"
+    elif msvc_tools:
+        toolchain = "msvc"
+    elif msys2_tools[0]:
+        toolchain = "msys2"
+    else:
         log(
-            "ERROR: FFmpeg source is present, but an MSYS2 build shell was not found. "
-            "Install MSYS2 with make + a MinGW/UCRT64 compiler, then run the downloader again."
+            "ERROR: No supported Windows FFmpeg build environment was found. "
+            "Use MSVC Build Tools + Git Bash + GNU Make, or install an MSYS2 MinGW/UCRT64 toolchain."
         )
         return False
+
+    WINDOWS_FFMPEG_BUILD_TOOLCHAIN = toolchain
     workspace = _prepare_windows_ffmpeg_workspace(log)
     if not workspace:
         return False
     staged_install = os.path.join(workspace, "_shared_install")
-    env = os.environ.copy()
-    env["FFMPEG_BUILD_WINDOWS"] = workspace
-    env["CHERE_INVOKING"] = "1"
-    env["MSYS2_PATH_TYPE"] = "inherit"
-    if msystem:
-        env["MSYSTEM"] = msystem
-    if toolchain_bin:
-        msys_root = os.path.dirname(os.path.dirname(toolchain_bin))
-        usr_bin = os.path.join(msys_root, "usr", "bin")
-        env["PATH"] = os.pathsep.join([toolchain_bin, usr_bin, env.get("PATH", "")])
-    _prepare_windows_hardware_build_dependencies(bash, toolchain_bin, msystem, env, log)
-    amf_include = _prepare_windows_amf_headers(workspace, log)
-    if amf_include:
-        env["DOWNLOADER_AMF_INCLUDE_WINDOWS"] = amf_include
 
-    build_script = r"""
+    if toolchain == "msys2":
+        bash, toolchain_bin, msystem = msys2_tools
+        env = os.environ.copy()
+        env["FFMPEG_BUILD_WINDOWS"] = workspace
+        env["CHERE_INVOKING"] = "1"
+        env["MSYS2_PATH_TYPE"] = "inherit"
+        if msystem:
+            env["MSYSTEM"] = msystem
+        if toolchain_bin:
+            msys_root = os.path.dirname(os.path.dirname(toolchain_bin))
+            usr_bin = os.path.join(msys_root, "usr", "bin")
+            env["PATH"] = os.pathsep.join([toolchain_bin, usr_bin, env.get("PATH", "")])
+        _prepare_windows_hardware_build_dependencies(bash, toolchain_bin, msystem, env, log)
+        amf_include = _prepare_windows_amf_headers(workspace, log)
+        if amf_include:
+            env["DOWNLOADER_AMF_INCLUDE_WINDOWS"] = amf_include
+
+        build_script = r"""
 set -o pipefail
 BUILDROOT="$(cygpath -u "$FFMPEG_BUILD_WINDOWS" 2>/dev/null || printf '%s' "$FFMPEG_BUILD_WINDOWS")"
 INSTALLROOT="$BUILDROOT/_shared_install"
@@ -1213,14 +1495,104 @@ make -j"$JOBS" || exit $?
 echo "Installing ffmpeg.exe, ffprobe.exe and FFmpeg DLLs into the staging folder..."
 make install || exit $?
 """
-    log(f"FFmpeg source checkout (read-only build input): {FFMPEG_SOURCE_DIR}")
-    log(f"FFmpeg compile workspace (separate from repository): {workspace}")
-    log(f"FFmpeg final build output: {FFMPEG_OUTPUT_BIN_DIR}")
-    log(f"FFmpeg build shell: {bash}")
-    log("FFmpeg build type: shared DLLs (--enable-shared --disable-static)")
-    if msystem:
-        log(f"MSYS2 environment: {msystem}")
-    build_code = _run_streamed_process([bash, "-lc", build_script], log, env=env)
+        log(f"FFmpeg build shell: {bash}")
+        log("FFmpeg Windows compiler: MSYS2 MinGW/UCRT64")
+        if msystem:
+            log(f"MSYS2 environment: {msystem}")
+        build_code = _run_streamed_process([bash, "-lc", build_script], log, env=env)
+        lame_runtime_dll = None
+    else:
+        bash, make, env, git_usr_bin = msvc_tools
+        env["FFMPEG_BUILD_WINDOWS"] = workspace
+        amf_include = _prepare_windows_amf_headers(workspace, log)
+        lame_paths = _prepare_msvc_lame(workspace, env, log)
+        if not lame_paths:
+            return False
+        lame_include, lame_lib, lame_runtime_dll = lame_paths
+        if amf_include:
+            env["DOWNLOADER_AMF_INCLUDE_WINDOWS"] = amf_include
+        build_script = r"""
+set -o pipefail
+BUILDROOT="$(cygpath -u "$FFMPEG_BUILD_WINDOWS" 2>/dev/null || printf '%s' "$FFMPEG_BUILD_WINDOWS")"
+INSTALLROOT="$BUILDROOT/_shared_install"
+cd "$BUILDROOT" || exit 90
+
+if ! command -v make >/dev/null 2>&1; then
+    echo "ERROR: GNU Make is unavailable in the selected non-MSYS2 shell."
+    exit 91
+fi
+if ! command -v cl.exe >/dev/null 2>&1 || ! command -v link.exe >/dev/null 2>&1; then
+    echo "ERROR: The Visual Studio compiler/linker environment was not inherited by Git Bash."
+    exit 92
+fi
+if ! command -v nmake.exe >/dev/null 2>&1; then
+    echo "ERROR: NMAKE is missing from the Visual Studio C++ Build Tools installation."
+    exit 93
+fi
+
+EXTRA_FLAGS=(--enable-d3d11va --enable-dxva2 --enable-libmp3lame)
+EXTRA_CFLAGS=("-I./__LAME_INCLUDE__")
+EXTRA_LDFLAGS=("/LIBPATH:./__LAME_LIB__")
+AMF_INCLUDE_WINDOWS="${DOWNLOADER_AMF_INCLUDE_WINDOWS:-}"
+if [ -n "$AMF_INCLUDE_WINDOWS" ]; then
+    AMF_INCLUDE="$(cygpath -m "$AMF_INCLUDE_WINDOWS" 2>/dev/null || printf '%s' "$AMF_INCLUDE_WINDOWS")"
+    if [ -f "$AMF_INCLUDE/AMF/core/Version.h" ]; then
+        EXTRA_CFLAGS+=("-I$AMF_INCLUDE")
+        echo "AMD AMF headers supplied to MSVC FFmpeg autodetection."
+    else
+        echo "WARNING: Staged AMD AMF headers were not found; continuing without forcing AMF."
+    fi
+else
+    echo "WARNING: Current AMD AMF headers were not staged; continuing without forcing AMF."
+fi
+if ! command -v nasm.exe >/dev/null 2>&1 && ! command -v nasm >/dev/null 2>&1; then
+    echo "NASM was not found; compiling with --disable-x86asm so the MSVC build can continue."
+    EXTRA_FLAGS+=(--disable-x86asm)
+fi
+if [ -f ffbuild/config.mak ]; then
+    echo "Removing the previous FFmpeg configuration before changing toolchains..."
+    make distclean || exit $?
+fi
+rm -rf "$INSTALLROOT"
+mkdir -p "$INSTALLROOT"
+echo "Configuring FFmpeg with the native Microsoft Visual C++ toolchain..."
+CONFIGURE_ARGS=(
+    --prefix="$INSTALLROOT"
+    --toolchain=msvc
+    --disable-doc
+    --disable-ffplay
+    --enable-gpl
+    --enable-version3
+    --enable-shared
+    --disable-static
+)
+CONFIGURE_ARGS+=("${EXTRA_FLAGS[@]}")
+CONFIGURE_ARGS+=("--extra-cflags=${EXTRA_CFLAGS[*]}")
+CONFIGURE_ARGS+=("--extra-ldflags=${EXTRA_LDFLAGS[*]}")
+echo "FFmpeg configure toolchain: MSVC"
+echo "FFmpeg configure extra C flags: ${EXTRA_CFLAGS[*]}"
+echo "FFmpeg configure extra linker flags: ${EXTRA_LDFLAGS[*]}"
+echo "FFmpeg configure hardware flags: ${EXTRA_FLAGS[*]}"
+bash ./configure "${CONFIGURE_ARGS[@]}"
+CONFIGURE_STATUS=$?
+if [ "$CONFIGURE_STATUS" -ne 0 ]; then
+    echo "ERROR: FFmpeg MSVC configure failed with code $CONFIGURE_STATUS."
+    if [ -f ffbuild/config.log ]; then
+        echo "Configure log in build workspace: $BUILDROOT/ffbuild/config.log"
+    fi
+    exit "$CONFIGURE_STATUS"
+fi
+JOBS="${NUMBER_OF_PROCESSORS:-4}"
+echo "Compiling FFmpeg shared build with MSVC and $JOBS parallel job(s)..."
+make -j"$JOBS" || exit $?
+echo "Installing ffmpeg.exe, ffprobe.exe and FFmpeg DLLs into the staging folder..."
+make install || exit $?
+""".replace("__LAME_INCLUDE__", lame_include).replace("__LAME_LIB__", lame_lib)
+        log(f"FFmpeg build shell: {bash}")
+        log(f"FFmpeg GNU Make: {make}")
+        log("FFmpeg Windows compiler: native MSVC (/toolchain=msvc); MSYS2 is not used.")
+        build_code = _run_streamed_process([bash, "-c", build_script], log, env=env)
+
     saved_config_log = _preserve_windows_configure_log(workspace, log)
     if build_code != 0:
         _log_configure_failure_tail(saved_config_log, log)
@@ -1231,6 +1603,13 @@ make install || exit $?
     if not (os.path.isfile(built_ffmpeg) and os.path.isfile(built_ffprobe)):
         log("ERROR: Shared build finished but staged ffmpeg.exe/ffprobe.exe were not produced.")
         return False
+    if toolchain == "msvc" and lame_runtime_dll:
+        try:
+            shutil.copy2(lame_runtime_dll, os.path.join(staged_bin, "libmp3lame.dll"))
+            log("Copied the MSVC-built LAME runtime DLL beside FFmpeg.")
+        except OSError as exc:
+            log(f"ERROR: Could not stage the required MSVC LAME runtime DLL: {exc}")
+            return False
     try:
         staged_names = os.listdir(staged_bin)
     except OSError as exc:
@@ -1253,7 +1632,8 @@ make install || exit $?
             + ", ".join(p.rstrip("-") for p in missing_prefixes)
         )
         return False
-    _copy_msys_runtime_dependencies(staged_bin, toolchain_bin, log)
+    if toolchain == "msys2":
+        _copy_msys_runtime_dependencies(staged_bin, toolchain_bin, log)
     try:
         os.makedirs(FFMPEG_OUTPUT_DIR, exist_ok=True)
         replacement_bin = os.path.join(FFMPEG_OUTPUT_DIR, "bin.new")
@@ -3259,36 +3639,104 @@ class Worker(threading.Thread):
                 ))
         return True
 
-    def _square_youtube_music_thumbnail(self, thumbnail_path: str) -> bool:
-        """Crop a YouTube Music thumbnail to its centered square artwork.
+    @staticmethod
+    def _thumbnail_has_matching_solid_side_bars(rgb: bytes, sample_width: int = 96, sample_height: int = 54) -> bool:
+        """Return True only when both sides look like matching flat-color bars."""
+        if sample_width != 96 or sample_height != 54 or len(rgb) != sample_width * sample_height * 3:
+            return False
+        side_width = (sample_width - sample_height) // 2
+        if side_width < 12:
+            return False
 
-        YT Music may expose a 16:9 image with the actual album art in the
-        center and generated background panels on either side. Center-cropping
-        to min(width, height) removes those panels without stretching the art.
+        def region_stats(x_start: int, x_end: int) -> tuple[tuple[float, float, float], float]:
+            count = (x_end - x_start) * sample_height
+            sums = [0, 0, 0]
+            pixels: list[tuple[int, int, int]] = []
+            for y in range(sample_height):
+                row_start = (y * sample_width + x_start) * 3
+                row_end = (y * sample_width + x_end) * 3
+                row = rgb[row_start:row_end]
+                for offset in range(0, len(row), 3):
+                    pixel = (row[offset], row[offset + 1], row[offset + 2])
+                    pixels.append(pixel)
+                    sums[0] += pixel[0]
+                    sums[1] += pixel[1]
+                    sums[2] += pixel[2]
+            means = tuple(total / count for total in sums)
+            deviation = sum(
+                abs(pixel[channel] - means[channel])
+                for pixel in pixels for channel in range(3)
+            ) / (count * 3)
+            return means, deviation
+
+        left_mean, left_deviation = region_stats(0, side_width)
+        right_mean, right_deviation = region_stats(sample_width - side_width, sample_width)
+        _, center_deviation = region_stats(side_width, sample_width - side_width)
+        side_color_difference = sum(abs(left_mean[i] - right_mean[i]) for i in range(3)) / 3
+
+        # Both side panels must be nearly flat and have nearly the same color.
+        # The center must contain visibly more image detail than those panels.
+        if side_color_difference > 14 or max(left_deviation, right_deviation) > 9:
+            return False
+        return center_deviation >= max(12, max(left_deviation, right_deviation) * 1.8 + 5)
+
+    def _square_youtube_music_thumbnail(self, thumbnail_path: str) -> bool:
+        """Crop only 16:9 YouTube Music thumbnails with clear centered-square artwork.
+
+        Ordinary 16:9 thumbnails, including those with detailed or differently
+        colored side content, are kept at their original dimensions.
         """
         if not os.path.isfile(thumbnail_path):
             return False
         info = probe_input_video(thumbnail_path)
-        width, height = info.get("width"), info.get("height")
         try:
-            width, height = int(width), int(height)
+            width, height = int(info.get("width") or 0), int(info.get("height") or 0)
         except (TypeError, ValueError):
             width = height = 0
-        if width > 0 and width == height:
+        if width <= 0 or height <= 0:
+            self.q.put(("log", f"Could not determine thumbnail dimensions; preserving the original image: {thumbnail_path}"))
+            return True
+        if width == height:
             self.q.put(("log", f"YouTube Music thumbnail is already square; preserving it: {thumbnail_path}"))
+            return True
+
+        aspect_ratio = width / height
+        if not (1.70 <= aspect_ratio <= 1.85 and width > height):
+            self.q.put(("log", f"YouTube Music thumbnail is not a 16:9-style image; preserving its {width}x{height} dimensions: {thumbnail_path}"))
             return True
 
         ffmpeg = find_ffmpeg_executable("ffmpeg")
         if not ffmpeg:
-            self.q.put(("error", "FFmpeg was not found; could not crop the YouTube Music thumbnail to a square."))
-            return False
+            self.q.put(("log", f"FFmpeg was not found for thumbnail analysis; preserving the original 16:9 image: {thumbnail_path}"))
+            return True
+
+        try:
+            sample = subprocess.run(
+                [
+                    ffmpeg, "-v", "error", "-nostdin", "-i", thumbnail_path,
+                    "-vf", "scale=96:54:flags=area", "-frames:v", "1",
+                    "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
+                ],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=25, check=False,
+            )
+            if sample.returncode != 0 or len(sample.stdout) != 96 * 54 * 3:
+                self.q.put(("log", f"Thumbnail bars could not be analyzed reliably; preserving the original image: {thumbnail_path}"))
+                return True
+            if not self._thumbnail_has_matching_solid_side_bars(sample.stdout):
+                self.q.put(("log", f"No matching solid-color side bars around centered square artwork were detected; preserving the original 16:9 image: {thumbnail_path}"))
+                return True
+        except Exception as exc:
+            self.q.put(("log", f"Thumbnail side-bar analysis failed; preserving the original image ({exc}): {thumbnail_path}"))
+            return True
+
         root, ext = os.path.splitext(thumbnail_path)
         temporary = root + ".square.tmp" + (ext or ".jpg")
         try:
             proc = subprocess.run(
                 [
                     ffmpeg, "-y", "-nostdin", "-i", thumbnail_path,
-                    "-vf", r"crop=min(iw\,ih):min(iw\,ih)",
+                    "-vf", "crop=ih:ih:(iw-ih)/2:0",
                     "-frames:v", "1", "-update", "1", temporary,
                 ],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -3299,7 +3747,7 @@ class Worker(threading.Thread):
                 detail = (proc.stdout or "").strip()
                 if len(detail) > 900:
                     detail = detail[-900:]
-                self.q.put(("error", f"Could not crop YouTube Music artwork to a square: {detail or 'FFmpeg failed.'}"))
+                self.q.put(("error", f"Could not crop the detected square YouTube Music artwork: {detail or 'FFmpeg failed.'}"))
                 return False
             cropped = probe_input_video(temporary)
             try:
@@ -3310,10 +3758,10 @@ class Worker(threading.Thread):
                 self.q.put(("error", f"FFmpeg output was not square; keeping the original thumbnail: {thumbnail_path}"))
                 return False
             os.replace(temporary, thumbnail_path)
-            self.q.put(("log", f"Cropped YouTube Music artwork from {width or '?'}x{height or '?'} to {crop_width}x{crop_height}: {thumbnail_path}"))
+            self.q.put(("log", f"Detected matching solid-color side bars and cropped centered square artwork from {width}x{height} to {crop_width}x{crop_height}: {thumbnail_path}"))
             return True
         except Exception as exc:
-            self.q.put(("error", f"Could not crop YouTube Music artwork: {exc}"))
+            self.q.put(("error", f"Could not crop detected YouTube Music artwork: {exc}"))
             return False
         finally:
             try:
