@@ -3660,14 +3660,20 @@ class Worker(threading.Thread):
 
     @staticmethod
     def _thumbnail_has_matching_solid_side_bars(rgb: bytes, sample_width: int = 96, sample_height: int = 54) -> bool:
-        """Return True only when both sides look like matching flat-color bars."""
-        if sample_width != 96 or sample_height != 54 or len(rgb) != sample_width * sample_height * 3:
+        """Return True only when matching side bars surround a square center."""
+        if (
+            sample_width <= sample_height
+            or (sample_width - sample_height) % 2
+            or len(rgb) != sample_width * sample_height * 3
+        ):
             return False
         side_width = (sample_width - sample_height) // 2
         if side_width < 12:
             return False
 
-        def region_stats(x_start: int, x_end: int) -> tuple[tuple[float, float, float], float]:
+        def region_stats(
+            x_start: int, x_end: int,
+        ) -> tuple[tuple[float, float, float], float, float]:
             count = (x_end - x_start) * sample_height
             sums = [0, 0, 0]
             pixels: list[tuple[int, int, int]] = []
@@ -3686,18 +3692,29 @@ class Worker(threading.Thread):
                 abs(pixel[channel] - means[channel])
                 for pixel in pixels for channel in range(3)
             ) / (count * 3)
-            return means, deviation
+            maximum_deviation = max(
+                abs(pixel[channel] - means[channel])
+                for pixel in pixels for channel in range(3)
+            )
+            return means, deviation, maximum_deviation
 
-        left_mean, left_deviation = region_stats(0, side_width)
-        right_mean, right_deviation = region_stats(sample_width - side_width, sample_width)
-        _, center_deviation = region_stats(side_width, sample_width - side_width)
+        left_mean, left_deviation, left_max_deviation = region_stats(0, side_width)
+        right_mean, right_deviation, right_max_deviation = region_stats(
+            sample_width - side_width, sample_width,
+        )
+        _, center_deviation, _ = region_stats(side_width, sample_width - side_width)
         side_color_difference = sum(abs(left_mean[i] - right_mean[i]) for i in range(3)) / 3
 
-        # Both side panels must be nearly flat and have nearly the same color.
-        # The center must contain visibly more image detail than those panels.
-        if side_color_difference > 14 or max(left_deviation, right_deviation) > 9:
+        # The bars must be genuinely flat and matching. This prevents ordinary
+        # 16:9 thumbnails with dark or similarly colored edge content from
+        # being mistaken for centered square artwork.
+        if (
+            side_color_difference > 10
+            or max(left_deviation, right_deviation) > 6
+            or max(left_max_deviation, right_max_deviation) > 18
+        ):
             return False
-        return center_deviation >= max(12, max(left_deviation, right_deviation) * 1.8 + 5)
+        return center_deviation >= max(14, max(left_deviation, right_deviation) * 2 + 6)
 
     def _square_youtube_music_thumbnail(self, thumbnail_path: str) -> bool:
         """Crop only 16:9 YouTube Music thumbnails with clear centered-square artwork.
@@ -3742,8 +3759,10 @@ class Worker(threading.Thread):
             if sample.returncode != 0 or len(sample.stdout) != 96 * 54 * 3:
                 self.q.put(("log", f"Thumbnail bars could not be analyzed reliably; preserving the original image: {thumbnail_path}"))
                 return True
-            if not self._thumbnail_has_matching_solid_side_bars(sample.stdout):
-                self.q.put(("log", f"No matching solid-color side bars around centered square artwork were detected; preserving the original 16:9 image: {thumbnail_path}"))
+            if not self._thumbnail_has_matching_solid_side_bars(
+                sample.stdout, 96, 54,
+            ):
+                self.q.put(("log", f"No matching solid-color side borders that form a centered 1:1 crop were detected; preserving the original 16:9 image: {thumbnail_path}"))
                 return True
         except Exception as exc:
             self.q.put(("log", f"Thumbnail side-bar analysis failed; preserving the original image ({exc}): {thumbnail_path}"))
