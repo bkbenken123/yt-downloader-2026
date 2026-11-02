@@ -39,6 +39,8 @@ FFMPEG_OUTPUT_DIR = os.path.join(BINARIES_DIR, "ffmpeg-build")
 FFMPEG_OUTPUT_BIN_DIR = os.path.join(FFMPEG_OUTPUT_DIR, "bin")
 YTDLP_SOURCE_DIR = os.path.join(BINARIES_DIR, "yt-dlp")
 YTDLP_TEMP_DIR_NAME = "yt-downloader-temp"
+APP_SOURCE_DIR = SCRIPT_DIR
+YTDLP_GIT_URL = "https://github.com/yt-dlp/yt-dlp.git"
 DEPENDENCIES_DIR = os.path.join(BINARIES_DIR, "dependencies")
 AMF_SOURCE_DIR = os.path.join(DEPENDENCIES_DIR, "AMF")
 NV_CODEC_HEADERS_DIR = os.path.join(DEPENDENCIES_DIR, "nv-codec-headers")
@@ -1890,30 +1892,52 @@ def update_ytdlp_installation() -> tuple[bool, list[str]]:
     messages: list[str] = []
     source_main = _ytdlp_source_main()
     if source_main:
-        messages.append(f"Using cloned yt-dlp source checkout: {YTDLP_SOURCE_DIR}")
         git = shutil.which("git")
-        if git and _ytdlp_is_standalone_git_checkout(git):
-            code, output = _run_update_command(
-                [git, "pull", "--ff-only"], timeout=180, cwd=YTDLP_SOURCE_DIR,
-            )
-            messages.append("yt-dlp source update: git pull --ff-only")
-            if output:
-                messages.extend(line for line in output.splitlines() if line.strip())
-            if code != 0:
-                messages.append(
-                    "WARNING: The yt-dlp source checkout could not be updated; "
-                    "the existing checkout will still be tested and used."
-                )
-        elif not git:
-            messages.append(
-                "WARNING: Git was not found on PATH, so the cloned yt-dlp checkout "
-                "could not be updated automatically."
-            )
+        if not git:
+            messages.append("WARNING: Git was not found on PATH, so yt-dlp could not be updated.")
         else:
-            messages.append(
-                "Embedded yt-dlp is part of this application repository; "
-                "skipping Git update to preserve its stripped checkout."
-            )
+            messages.append("Checking yt-dlp for updates...")
+            temp_root = tempfile.mkdtemp(prefix="yt-dlp-update-", dir=tempfile.gettempdir())
+            staged_dir = os.path.join(temp_root, "source")
+            backup_dir = os.path.join(temp_root, "current")
+            try:
+                code, output = _run_update_command(
+                    [git, "clone", "--depth", "1", YTDLP_GIT_URL, staged_dir],
+                    timeout=900,
+                )
+                if output:
+                    messages.extend(line for line in output.splitlines() if line.strip())
+                staged_package = os.path.join(staged_dir, "yt_dlp")
+                if code != 0 or not os.path.isfile(os.path.join(staged_package, "__main__.py")):
+                    messages.append("WARNING: Could not download the latest yt-dlp runtime; using the existing checkout.")
+                else:
+                    new_version_code, new_version = _run_update_command(
+                        [sys.executable, os.path.join(staged_package, "__main__.py"), "--version"],
+                        timeout=30,
+                    )
+                    current_version_code, current_version = _run_update_command(
+                        [sys.executable, source_main, "--version"], timeout=30,
+                    )
+                    new_version = new_version.strip().splitlines()[-1] if new_version.strip() else "unknown"
+                    current_version = current_version.strip().splitlines()[-1] if current_version.strip() else "unknown"
+                    if new_version_code == 0 and current_version_code == 0 and new_version == current_version:
+                        messages.append(f"yt-dlp is already up to date at {current_version}.")
+                    else:
+                        replacement = os.path.join(temp_root, "yt_dlp")
+                        shutil.copytree(staged_package, replacement)
+                        current_package = os.path.join(YTDLP_SOURCE_DIR, "yt_dlp")
+                        os.replace(current_package, backup_dir)
+                        try:
+                            os.replace(replacement, current_package)
+                        except Exception:
+                            os.replace(backup_dir, current_package)
+                            raise
+                        shutil.rmtree(backup_dir, ignore_errors=True)
+                        messages.append(f"yt-dlp runtime updated: {current_version} -> {new_version}.")
+            except (OSError, shutil.Error) as exc:
+                messages.append(f"WARNING: Could not update yt-dlp runtime: {exc}")
+            finally:
+                shutil.rmtree(temp_root, ignore_errors=True)
         try:
             _prune_ytdlp_checkout()
         except OSError as exc:
@@ -1959,6 +1983,98 @@ def update_ytdlp_installation() -> tuple[bool, list[str]]:
     if version_output:
         messages.append(f"Installed yt-dlp version: {version_output.splitlines()[-1]}")
     return verify_code == 0 or get_ytdlp_command() is not None, messages
+
+
+def _app_git_checkout(git: str) -> bool:
+    code, output = _run_update_command(
+        [git, "rev-parse", "--show-toplevel"], cwd=APP_SOURCE_DIR, timeout=15,
+    )
+    return code == 0 and os.path.normcase(os.path.abspath(output.strip())) == os.path.normcase(
+        os.path.abspath(APP_SOURCE_DIR),
+    )
+
+
+def check_app_update_available(log) -> tuple[bool, bool, str]:
+    git = shutil.which("git")
+    if not git or not _app_git_checkout(git):
+        message = "The application folder is not a Git checkout, so app updates cannot be checked."
+        log(f"WARNING: {message}")
+        return False, False, message
+    branch_code, branch_output = _run_update_command(
+        [git, "branch", "--show-current"], cwd=APP_SOURCE_DIR, timeout=15,
+    )
+    branch = branch_output.strip()
+    if branch != "main":
+        message = f"Application updates target main, but this checkout is on {branch or 'detached HEAD'}; leaving it unchanged."
+        log(message)
+        return True, False, message
+    fetch_code, fetch_output = _run_update_command(
+        [git, "fetch", "--quiet", "--prune", "origin", "main"], cwd=APP_SOURCE_DIR, timeout=120,
+    )
+    if fetch_code != 0:
+        message = "Could not check the application repository for updates."
+        log(f"WARNING: {message}")
+        if fetch_output:
+            log(f"[app-git] {fetch_output.splitlines()[-1]}")
+        return False, False, message
+    head_code, head_output = _run_update_command(
+        [git, "rev-parse", "HEAD"], cwd=APP_SOURCE_DIR, timeout=15,
+    )
+    remote_code, remote_output = _run_update_command(
+        [git, "rev-parse", "origin/main"], cwd=APP_SOURCE_DIR, timeout=15,
+    )
+    if head_code != 0 or remote_code != 0:
+        message = "Could not determine the current or remote application revision."
+        log(f"WARNING: {message}")
+        return False, False, message
+    head = head_output.strip()[:12]
+    remote = remote_output.strip()[:12]
+    if head == remote:
+        message = f"Application is up to date at {head}."
+        log(message)
+        return True, False, message
+    ancestor_code, _ = _run_update_command(
+        [git, "merge-base", "--is-ancestor", "HEAD", "origin/main"],
+        cwd=APP_SOURCE_DIR, timeout=15,
+    )
+    if ancestor_code == 0:
+        message = f"Application update is available: {head} -> {remote}."
+        log(message)
+        return True, True, message
+    message = "Application checkout has diverged from origin/main; leaving it unchanged."
+    log(f"WARNING: {message}")
+    return False, False, message
+
+
+def update_app_source_checkout(log) -> tuple[bool, bool, str]:
+    git = shutil.which("git")
+    if not git or not _app_git_checkout(git):
+        message = "The application folder is not a Git checkout, so app updates cannot be installed."
+        log(f"ERROR: {message}")
+        return False, False, message
+    branch_code, branch_output = _run_update_command(
+        [git, "branch", "--show-current"], cwd=APP_SOURCE_DIR, timeout=15,
+    )
+    branch = branch_output.strip()
+    if branch != "main":
+        message = f"Application updates target main, but this checkout is on {branch or 'detached HEAD'}."
+        log(f"WARNING: {message}")
+        return True, False, message
+    code, output = _run_update_command(
+        [git, "pull", "--ff-only", "origin", "main"], cwd=APP_SOURCE_DIR, timeout=180,
+    )
+    if output:
+        for line in output.splitlines():
+            if line.strip():
+                log(f"[app-git] {line}")
+    if code != 0:
+        message = "Application update failed; the existing checkout was left unchanged."
+        log(f"ERROR: {message}")
+        return False, False, message
+    changed = "Already up to date." not in output
+    message = "Application source was updated successfully." if changed else "Application is already up to date."
+    log(message)
+    return True, changed, message
 
 
 def parse_ffmpeg_component_names(output: str) -> set[str]:
@@ -3668,16 +3784,16 @@ class App:
         if self.startup_prepare_in_progress:
             parent = self.settings_window if self.settings_window is not None else self.root
             messagebox.showinfo(
-                "FFmpeg update",
-                "Startup tool preparation is still running. Try the FFmpeg update again after it finishes.",
+                "Tools & app update",
+                "Startup tool preparation is still running. Try the update again after it finishes.",
                 parent=parent,
             )
             return
         if self.worker is not None and self.worker.is_alive():
             parent = self.settings_window if self.settings_window is not None else self.root
             messagebox.showwarning(
-                "FFmpeg update",
-                "A download/conversion is currently running. Update FFmpeg after it finishes.",
+                "Tools & app update",
+                "A download/conversion is currently running. Update after it finishes.",
                 parent=parent,
             )
             return
@@ -3686,21 +3802,27 @@ class App:
             self.ffmpeg_update_button.configure(state="disabled")
         if self.ffmpeg_update_status_var is not None:
             self.ffmpeg_update_status_var.set("Checking for updates...")
-        self.status_var.set("Updating FFmpeg")
+        self.status_var.set("Updating tools and app")
         self.start_btn.configure(state="disabled")
-        self.log("Manual FFmpeg update requested from Settings.")
+        self.log("Manual tool and application update requested from Settings.")
         threading.Thread(target=self._ffmpeg_update_thread, daemon=True).start()
 
     def _ffmpeg_update_thread(self) -> None:
         def update_log(message: str) -> None:
             self.q.put(("log", message))
+        results: list[str] = []
+        overall_success = True
+        any_changed = False
+        rebuilt = False
         try:
             success, changed, summary = update_ffmpeg_source_checkout(update_log)
         except Exception as exc:
             success, changed = False, False
             summary = f"FFmpeg update failed unexpectedly: {exc}"
             update_log(f"ERROR: {summary}")
-        rebuilt = False
+        results.append(summary)
+        overall_success = overall_success and success
+        any_changed = any_changed or changed
         if success and changed:
             try:
                 rebuilt = ensure_ffmpeg_ready(update_log, force_rebuild=True)
@@ -3715,7 +3837,38 @@ class App:
                     "The log contains the build error; the app will retry the rebuild on the next startup."
                 )
                 success = False
-        self.q.put(("ffmpeg_update_done", success, changed, rebuilt, summary))
+                overall_success = False
+            if rebuilt:
+                results[-1] = "FFmpeg source was updated and rebuilt successfully."
+            else:
+                results[-1] = "FFmpeg source was updated, but rebuilding failed."
+        try:
+            ytdlp_success, ytdlp_messages = update_ytdlp_installation()
+            for message in ytdlp_messages:
+                update_log(message)
+            ytdlp_changed = any("runtime updated:" in message for message in ytdlp_messages)
+            any_changed = any_changed or ytdlp_changed
+            overall_success = overall_success and ytdlp_success
+            results.append(
+                "yt-dlp was updated successfully." if ytdlp_changed
+                else "yt-dlp is already up to date."
+                if ytdlp_success else "yt-dlp update failed."
+            )
+        except Exception as exc:
+            overall_success = False
+            results.append(f"yt-dlp update failed unexpectedly: {exc}")
+            update_log(f"ERROR: {results[-1]}")
+        try:
+            app_success, app_changed, app_summary = update_app_source_checkout(update_log)
+            overall_success = overall_success and app_success
+            any_changed = any_changed or app_changed
+            results.append(app_summary)
+        except Exception as exc:
+            overall_success = False
+            results.append(f"Application update failed unexpectedly: {exc}")
+            update_log(f"ERROR: {results[-1]}")
+        summary = "\n".join(results)
+        self.q.put(("ffmpeg_update_done", overall_success, any_changed, rebuilt, summary))
 
     def open_settings(self) -> None:
         if self.settings_window is not None and self.settings_window.winfo_exists():
@@ -3779,12 +3932,12 @@ class App:
         ttk.Separator(content, orient="horizontal").grid(
             row=5, column=0, columnspan=3, sticky="ew", pady=(2, 12),
         )
-        ttk.Label(content, text="FFmpeg update:").grid(
+        ttk.Label(content, text="Updates:").grid(
             row=6, column=0, sticky="w", padx=(0, 12), pady=(0, 4),
         )
         self.ffmpeg_update_status_var = tk.StringVar(value="")
         self.ffmpeg_update_button = ttk.Button(
-            content, text="Check / Update FFmpeg",
+            content, text="Check / Update Tools & App",
             command=self._start_ffmpeg_update,
             state="disabled" if (self.startup_prepare_in_progress or self.ffmpeg_update_in_progress) else "normal",
         )
@@ -4169,6 +4322,8 @@ class App:
                     if self.ffmpeg_update_status_var is not None:
                         if success and changed and rebuilt:
                             self.ffmpeg_update_status_var.set("Updated and rebuilt successfully")
+                        elif success and changed:
+                            self.ffmpeg_update_status_var.set("Updated successfully")
                         elif success and not changed:
                             self.ffmpeg_update_status_var.set("Already up to date")
                         else:
@@ -4181,9 +4336,9 @@ class App:
                         self.status_var.set("Tool setup failed")
                     parent = self.settings_window if self.settings_window is not None else self.root
                     if success:
-                        messagebox.showinfo("FFmpeg update", summary, parent=parent)
+                        messagebox.showinfo("Tools & app update", summary, parent=parent)
                     else:
-                        messagebox.showerror("FFmpeg update", summary, parent=parent)
+                        messagebox.showerror("Tools & app update", summary, parent=parent)
                 else:
                     self.log(f"Unknown queue message: {item}")
         except queue.Empty:
