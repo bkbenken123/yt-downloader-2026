@@ -279,14 +279,36 @@ fn stream_command(mut cmd: Command, tx: &Sender<Event>, prefix: &str) -> i32 {
             return -1;
         }
     };
-    if let Some(out) = child.stdout.take() {
-        for line in BufReader::new(out).lines().flatten() {
-            if !line.trim().is_empty() {
-                let _ = tx.send(Event::Log(format!("{prefix}{line}")));
+    let stdout = child.stdout.take().map(|out| {
+        let tx = tx.clone();
+        let prefix = prefix.to_string();
+        thread::spawn(move || {
+            for line in BufReader::new(out).lines().flatten() {
+                if !line.trim().is_empty() {
+                    let _ = tx.send(Event::Log(format!("{prefix}{line}")));
+                }
             }
-        }
+        })
+    });
+    let stderr = child.stderr.take().map(|err| {
+        let tx = tx.clone();
+        let prefix = prefix.to_string();
+        thread::spawn(move || {
+            for line in BufReader::new(err).lines().flatten() {
+                if !line.trim().is_empty() {
+                    let _ = tx.send(Event::Log(format!("{prefix}{line}")));
+                }
+            }
+        })
+    });
+    let code = child.wait().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
+    if let Some(handle) = stdout {
+        let _ = handle.join();
     }
-    child.wait().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1)
+    if let Some(handle) = stderr {
+        let _ = handle.join();
+    }
+    code
 }
 
 fn sanitize_filename(name: &str) -> String {
@@ -415,6 +437,25 @@ fn audio_codec_for(container: &str, codec: &str) -> Vec<String> {
     let _ = container;
     a
 }
+fn compatible_audio(mode: &str, container: &str, codec: &str) -> bool {
+    if mode == "video" {
+        match container {
+            "mp4" | "mov" => ["copy", "aac", "flac", "lpcm", "mpeg-1", "mpeg-2"].contains(&codec),
+            "mkv" => AUDIO_CODECS.contains(&codec),
+            "webm" => ["copy", "opus"].contains(&codec),
+            _ => false,
+        }
+    } else {
+        match container {
+            "mp3" => ["copy", "mpeg-1"].contains(&codec),
+            "m4a" => ["copy", "aac"].contains(&codec),
+            "wav" => ["copy", "lpcm"].contains(&codec),
+            "flac" => ["copy", "flac"].contains(&codec),
+            "opus" => ["copy", "opus"].contains(&codec),
+            _ => false,
+        }
+    }
+}
 fn video_codec_args(codec: &str) -> Vec<String> {
     match codec {
         "copy" => vec!["-c:v".into(), "copy".into()],
@@ -444,8 +485,7 @@ fn video_codec_args(codec: &str) -> Vec<String> {
     }
 }
 fn native_audio(container: &str, s: &Settings) -> bool {
-    s.use_ytdlp_audio_conversion
-        && (container == "mp3" || (s.embed_metadata && COVER_AUDIO.contains(&container)))
+    s.use_ytdlp_audio_conversion && (container == "mp3" || (s.embed_metadata && container == "m4a"))
 }
 
 fn run_download(urls: Vec<String>, opts: Options, tx: Sender<Event>) {
@@ -517,11 +557,20 @@ fn run_download(urls: Vec<String>, opts: Options, tx: Sender<Event>) {
         let native_a = opts.mode == "audio" && native_audio(&opts.container, &opts.settings);
         let native_v =
             opts.mode == "video" && opts.video_codec == "copy" && opts.audio_codec == "copy";
+        let ytdlp_can_embed_thumbnail = opts.settings.embed_metadata
+            && (opts.mode == "video" || matches!(opts.container.as_str(), "mp3" | "m4a"));
         if opts.settings.embed_metadata && opts.mode != "thumbnail" {
             args.extend(["--embed-metadata".into(), "--embed-chapters".into()]);
-            if COVER_AUDIO.contains(&opts.container.as_str()) || opts.mode == "video" {
+            if ytdlp_can_embed_thumbnail {
                 args.extend([
                     "--embed-thumbnail".into(),
+                    "--convert-thumbnails".into(),
+                    "jpg".into(),
+                ]);
+            } else if opts.mode == "audio" && COVER_AUDIO.contains(&opts.container.as_str()) {
+                args.extend([
+                    "--no-embed-thumbnail".into(),
+                    "--write-thumbnail".into(),
                     "--convert-thumbnails".into(),
                     "jpg".into(),
                 ]);
@@ -605,7 +654,12 @@ fn run_download(urls: Vec<String>, opts: Options, tx: Sender<Event>) {
                             .or_else(|| m.get(2))
                             .map(|x| x.as_str().trim().trim_matches('"'));
                         if let Some(p) = p {
-                            paths.push(PathBuf::from(p));
+                            let path = PathBuf::from(p);
+                            paths.push(if path.is_absolute() {
+                                path
+                            } else {
+                                folder.join(path)
+                            });
                         }
                     }
                 }
@@ -668,7 +722,11 @@ fn run_download(urls: Vec<String>, opts: Options, tx: Sender<Event>) {
         for src in media {
             let dst = src.with_extension(&opts.container);
             let ok = if native {
-                fs::rename(&src, &dst).is_ok()
+                if src == dst {
+                    dst.is_file()
+                } else {
+                    fs::rename(&src, &dst).is_ok()
+                }
             } else {
                 convert(
                     &src,
@@ -720,24 +778,36 @@ fn convert(
     ));
     let mut c = Command::new(ff);
     c.args(["-y", "-nostdin", "-i"]).arg(src);
+    if let Some(t) = thumb.as_ref() {
+        if (opts.mode == "audio"
+            && opts.settings.embed_metadata
+            && COVER_AUDIO.contains(&opts.container.as_str()))
+            || (opts.mode == "video"
+                && opts.settings.embed_metadata
+                && ["mp4", "mov"].contains(&opts.container.as_str()))
+        {
+            c.args(["-i"]).arg(t);
+        }
+    }
     if opts.mode == "thumbnail" {
         c.args(["-frames:v", "1"]);
     } else if opts.mode == "audio" {
         c.args(["-map", "0:a:0?", "-vn", "-map_metadata", "0"])
             .args(audio_codec_for(&opts.container, &opts.audio_codec));
-        if opts.settings.embed_metadata && COVER_AUDIO.contains(&opts.container.as_str()) {
-            if let Some(t) = thumb {
-                c.args(["-i"]).arg(t).args([
-                    "-map",
-                    "0:a:0?",
-                    "-map",
-                    "1:v:0?",
-                    "-c:v",
-                    "mjpeg",
-                    "-disposition:v",
-                    "attached_pic",
-                ]);
-            }
+        if opts.settings.embed_metadata
+            && COVER_AUDIO.contains(&opts.container.as_str())
+            && thumb.is_some()
+        {
+            c.args([
+                "-map",
+                "0:a:0?",
+                "-map",
+                "1:v:0?",
+                "-c:v",
+                "mjpeg",
+                "-disposition:v",
+                "attached_pic",
+            ]);
         }
     } else {
         c.args([
@@ -754,15 +824,24 @@ fn convert(
         if opts.settings.embed_metadata {
             c.args(["-map_chapters", "0"]);
         }
-        if let Some(t) = thumb {
-            if ["mp4", "mov"].contains(&opts.container.as_str()) {
-                c.args(["-i"]).arg(t).args([
-                    "-map",
-                    "1:v:0?",
-                    "-c:v:1",
-                    "mjpeg",
-                    "-disposition:v:1",
-                    "attached_pic",
+        if thumb.is_some() && ["mp4", "mov"].contains(&opts.container.as_str()) {
+            c.args([
+                "-map",
+                "1:v:0?",
+                "-c:v:1",
+                "mjpeg",
+                "-disposition:v:1",
+                "attached_pic",
+            ]);
+        } else if let Some(t) = thumb.as_ref() {
+            if opts.settings.embed_metadata && opts.container == "mkv" {
+                c.args([
+                    "-attach",
+                    &t.to_string_lossy(),
+                    "-metadata:s:t:0",
+                    "mimetype=image/jpeg",
+                    "-metadata:s:t:0",
+                    "filename=cover.jpg",
                 ]);
             }
         }
@@ -957,18 +1036,36 @@ impl App {
         }
     }
     fn validate(&self) -> Result<(), String> {
-        if self.mode == "video" && !compatible_video(&self.container, &self.video_codec) {
-            return Err(format!(
-                "Video codec '{}' is not compatible with {}.",
-                self.video_codec, self.container
-            ));
+        if self.mode == "video" {
+            if !compatible_video(&self.container, &self.video_codec) {
+                return Err(format!(
+                    "Video codec '{}' is not compatible with {}.",
+                    self.video_codec, self.container
+                ));
+            }
+            if !compatible_audio("video", &self.container, &self.audio_codec) {
+                return Err(format!(
+                    "Audio codec '{}' is not compatible with {}.",
+                    self.audio_codec, self.container
+                ));
+            }
         }
         if self.mode == "audio"
             && !native_audio(&self.container, &self.settings)
-            && self.audio_codec == "copy"
-            && self.container != "mkv"
+            && !compatible_audio("audio", &self.container, &self.audio_codec)
         {
-            return Err("Choose a compatible audio codec for the selected container.".into());
+            let recommended = match self.container.as_str() {
+                "mp3" => "mpeg-1",
+                "m4a" => "aac",
+                "wav" => "lpcm",
+                "flac" => "flac",
+                "opus" => "opus",
+                _ => "copy",
+            };
+            return Err(format!(
+                "Audio codec '{}' is not compatible with {}. Use '{}' or 'copy'.",
+                self.audio_codec, self.container, recommended
+            ));
         }
         Ok(())
     }
