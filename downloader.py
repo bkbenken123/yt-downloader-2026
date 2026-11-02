@@ -38,6 +38,7 @@ FFMPEG_GIT_URLS = (
 FFMPEG_OUTPUT_DIR = os.path.join(BINARIES_DIR, "ffmpeg-build")
 FFMPEG_OUTPUT_BIN_DIR = os.path.join(FFMPEG_OUTPUT_DIR, "bin")
 YTDLP_SOURCE_DIR = os.path.join(BINARIES_DIR, "yt-dlp")
+YTDLP_TEMP_DIR_NAME = "yt-downloader-temp"
 DEPENDENCIES_DIR = os.path.join(BINARIES_DIR, "dependencies")
 AMF_SOURCE_DIR = os.path.join(DEPENDENCIES_DIR, "AMF")
 NV_CODEC_HEADERS_DIR = os.path.join(DEPENDENCIES_DIR, "nv-codec-headers")
@@ -383,6 +384,30 @@ def find_ffmpeg_executable(name: str) -> Optional[str]:
 def _ytdlp_source_main() -> Optional[str]:
     path = os.path.join(YTDLP_SOURCE_DIR, "yt_dlp", "__main__.py")
     return os.path.abspath(path) if os.path.isfile(path) else None
+
+
+def _ytdlp_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    bases = (
+        environment.get("LOCALAPPDATA"),
+        environment.get("XDG_CACHE_HOME"),
+        environment.get("TEMP"),
+        environment.get("TMP"),
+        tempfile.gettempdir(),
+    )
+    for base in bases:
+        if not base:
+            continue
+        candidate = os.path.abspath(os.path.join(base, YTDLP_TEMP_DIR_NAME))
+        try:
+            os.makedirs(candidate, exist_ok=True)
+            if os.access(candidate, os.W_OK):
+                environment["TEMP"] = candidate
+                environment["TMP"] = candidate
+                return environment
+        except OSError:
+            continue
+    raise OSError("Could not create a writable temporary directory for yt-dlp")
 
 
 def find_ytdlp_executable() -> Optional[str]:
@@ -2384,6 +2409,7 @@ class Worker(threading.Thread):
                 [*command, url, "--dump-single-json", "--flat-playlist",
                  "--no-warnings", "--yes-playlist"],
                 capture_output=True, text=True, timeout=45, check=False,
+                env=_ytdlp_environment(),
             )
             if proc.returncode == 0:
                 data = json.loads(proc.stdout)
@@ -2581,7 +2607,7 @@ class Worker(threading.Thread):
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace",
-                bufsize=1, stdin=subprocess.DEVNULL,
+                bufsize=1, stdin=subprocess.DEVNULL, env=_ytdlp_environment(),
             )
         except Exception as exc:
             self.q.put(("error", f"Failed to start yt-dlp: {exc}"))
