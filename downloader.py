@@ -410,6 +410,39 @@ def _ytdlp_environment() -> tuple[dict[str, str], str]:
     raise OSError("Could not create a writable temporary directory for yt-dlp")
 
 
+def _prune_ytdlp_checkout() -> None:
+    allowed_root_entries = {".git", "yt_dlp"}
+    for name in os.listdir(YTDLP_SOURCE_DIR):
+        if name in allowed_root_entries:
+            continue
+        path = os.path.join(YTDLP_SOURCE_DIR, name)
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path)
+        else:
+            os.remove(path)
+    for relative_path in (
+        os.path.join("yt_dlp", "__pyinstaller"),
+        os.path.join("yt_dlp", "extractor", "youtube", "jsc", "README.md"),
+        os.path.join("yt_dlp", "extractor", "youtube", "pot", "README.md"),
+    ):
+        path = os.path.join(YTDLP_SOURCE_DIR, relative_path)
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+        elif os.path.isfile(path):
+            os.remove(path)
+
+
+def _ytdlp_is_standalone_git_checkout(git: str) -> bool:
+    code, output = _run_update_command(
+        [git, "rev-parse", "--show-toplevel"], cwd=YTDLP_SOURCE_DIR, timeout=15,
+    )
+    if code != 0:
+        return False
+    return os.path.normcase(os.path.abspath(output.strip())) == os.path.normcase(
+        os.path.abspath(YTDLP_SOURCE_DIR),
+    )
+
+
 def find_ytdlp_executable() -> Optional[str]:
     if sys.platform.startswith("linux"):
         path = os.path.join(BINARIES_DIR, "yt-dlp_linux")
@@ -1859,8 +1892,7 @@ def update_ytdlp_installation() -> tuple[bool, list[str]]:
     if source_main:
         messages.append(f"Using cloned yt-dlp source checkout: {YTDLP_SOURCE_DIR}")
         git = shutil.which("git")
-        git_dir = os.path.join(YTDLP_SOURCE_DIR, ".git")
-        if git and os.path.isdir(git_dir):
+        if git and _ytdlp_is_standalone_git_checkout(git):
             code, output = _run_update_command(
                 [git, "pull", "--ff-only"], timeout=180, cwd=YTDLP_SOURCE_DIR,
             )
@@ -1877,6 +1909,15 @@ def update_ytdlp_installation() -> tuple[bool, list[str]]:
                 "WARNING: Git was not found on PATH, so the cloned yt-dlp checkout "
                 "could not be updated automatically."
             )
+        else:
+            messages.append(
+                "Embedded yt-dlp is part of this application repository; "
+                "skipping Git update to preserve its stripped checkout."
+            )
+        try:
+            _prune_ytdlp_checkout()
+        except OSError as exc:
+            messages.append(f"WARNING: Could not prune yt-dlp checkout: {exc}")
         verify_code, version_output = _run_update_command(
             [sys.executable, source_main, "--version"], timeout=30,
         )
