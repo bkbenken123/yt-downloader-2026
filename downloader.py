@@ -66,6 +66,7 @@ DEFAULT_CONFIG = {
     "download_playlist": True,
     "use_ytdlp_audio_conversion": True,
     "embed_metadata": False,
+    "ytdlp_cookies_browser": "none",
 }
 
 
@@ -210,6 +211,11 @@ def _validated_config(raw: object) -> dict:
     embed_metadata = raw.get("embed_metadata")
     if isinstance(embed_metadata, bool):
         config["embed_metadata"] = embed_metadata
+    cookies_browser = raw.get("ytdlp_cookies_browser")
+    if isinstance(cookies_browser, str) and cookies_browser.casefold() in {
+        "none", "chrome", "edge", "firefox", "brave", "opera", "vivaldi",
+    }:
+        config["ytdlp_cookies_browser"] = cookies_browser.casefold()
     return config
 
 
@@ -3025,6 +3031,19 @@ class Worker(threading.Thread):
         ]
         env, temp_dir = _ytdlp_environment()
         cmd += ["--paths", f"temp:{temp_dir}"]
+        cookies_browser = str(self.opts.get("ytdlp_cookies_browser") or "none").casefold()
+        if cookies_browser != "none":
+            cmd += ["--cookies-from-browser", cookies_browser]
+            self.q.put((
+                "log",
+                f"yt-dlp will load YouTube cookies from the {cookies_browser} browser profile.",
+            ))
+        else:
+            self.q.put((
+                "log",
+                "yt-dlp browser cookies are disabled; if YouTube requests sign-in, "
+                "select a browser in Settings and retry.",
+            ))
         if playlist_enabled:
             # Skip unavailable playlist entries but continue downloading the rest.
             # ERROR lines are classified below so unrelated failures stay visible.
@@ -4336,6 +4355,9 @@ class App:
         playlist_var = tk.StringVar(value="Yes" if self.settings["download_playlist"] else "No")
         ytdlp_audio_var = tk.BooleanVar(value=self.settings["use_ytdlp_audio_conversion"])
         embed_metadata_var = tk.BooleanVar(value=self.settings["embed_metadata"])
+        cookies_browser_var = tk.StringVar(
+            value=self.settings.get("ytdlp_cookies_browser", "none").title(),
+        )
 
         ttk.Label(content, text="Encoder backend:").grid(
             row=0, column=0, sticky="w", padx=(0, 12), pady=(0, 10),
@@ -4377,11 +4399,24 @@ class App:
             text="Embed thumbnail, metadata, and chapters (yt-dlp where supported; no subtitles)",
             variable=embed_metadata_var,
         ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(0, 14))
+        ttk.Label(content, text="YouTube cookies:").grid(
+            row=5, column=0, sticky="w", padx=(0, 12), pady=(0, 10),
+        )
+        cookies_browser_box = ttk.Combobox(
+            content, textvariable=cookies_browser_var,
+            values=("None", "Chrome", "Edge", "Firefox", "Brave", "Opera", "Vivaldi"),
+            state="readonly", width=18,
+        )
+        cookies_browser_box.grid(row=5, column=1, sticky="w", pady=(0, 10))
+        ttk.Label(
+            content,
+            text="Use a signed-in browser profile when YouTube blocks downloads.",
+        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(0, 10))
         ttk.Separator(content, orient="horizontal").grid(
-            row=5, column=0, columnspan=3, sticky="ew", pady=(2, 12),
+            row=7, column=0, columnspan=3, sticky="ew", pady=(2, 12),
         )
         ttk.Label(content, text="Updates:").grid(
-            row=6, column=0, sticky="w", padx=(0, 12), pady=(0, 4),
+            row=8, column=0, sticky="w", padx=(0, 12), pady=(0, 4),
         )
         self.ffmpeg_update_status_var = tk.StringVar(value="")
         self.ffmpeg_update_button = ttk.Button(
@@ -4389,13 +4424,13 @@ class App:
             command=self._start_ffmpeg_update,
             state="disabled" if (self.startup_prepare_in_progress or self.ffmpeg_update_in_progress) else "normal",
         )
-        self.ffmpeg_update_button.grid(row=6, column=1, sticky="w", pady=(0, 4))
+        self.ffmpeg_update_button.grid(row=8, column=1, sticky="w", pady=(0, 4))
         ttk.Label(content, textvariable=self.ffmpeg_update_status_var).grid(
-            row=7, column=0, columnspan=3, sticky="w", pady=(0, 10),
+            row=9, column=0, columnspan=3, sticky="w", pady=(0, 10),
         )
         content.columnconfigure(1, weight=1)
         buttons = ttk.Frame(content)
-        buttons.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        buttons.grid(row=10, column=0, columnspan=3, sticky="ew", pady=(12, 0))
 
         def save_settings() -> None:
             directory = directory_var.get().strip()
@@ -4410,6 +4445,7 @@ class App:
                 "download_playlist": playlist_var.get() == "Yes",
                 "use_ytdlp_audio_conversion": bool(ytdlp_audio_var.get()),
                 "embed_metadata": bool(embed_metadata_var.get()),
+                "ytdlp_cookies_browser": cookies_browser_var.get().casefold(),
             }
             try:
                 save_config(new_settings)
@@ -4442,6 +4478,7 @@ class App:
             playlist_var.set("Yes" if DEFAULT_CONFIG["download_playlist"] else "No")
             ytdlp_audio_var.set(DEFAULT_CONFIG["use_ytdlp_audio_conversion"])
             embed_metadata_var.set(DEFAULT_CONFIG["embed_metadata"])
+            cookies_browser_var.set(DEFAULT_CONFIG["ytdlp_cookies_browser"].title())
 
         ttk.Button(buttons, text="Save", command=save_settings).pack(side="left")
         ttk.Button(buttons, text="Reset to Defaults", command=reset_fields).pack(side="right")
@@ -4722,6 +4759,7 @@ class App:
             "download_playlist": self.settings["download_playlist"],
             "use_ytdlp_audio_conversion": self.settings["use_ytdlp_audio_conversion"],
             "embed_metadata": self.settings["embed_metadata"],
+            "ytdlp_cookies_browser": self.settings["ytdlp_cookies_browser"],
         }
         self.status_var.set("Running")
         self.start_btn.configure(state="disabled")
