@@ -39,12 +39,15 @@ FFMPEG_GIT_URLS = (
 FFMPEG_OUTPUT_DIR = os.path.join(BINARIES_DIR, "ffmpeg-build")
 FFMPEG_OUTPUT_BIN_DIR = os.path.join(FFMPEG_OUTPUT_DIR, "bin")
 YTDLP_SOURCE_DIR = os.path.join(BINARIES_DIR, "yt-dlp")
+YTDLP_TEMP_DIR_NAME = "yt-downloader-temp"
+APP_SOURCE_DIR = SCRIPT_DIR
+YTDLP_GIT_URL = "https://github.com/yt-dlp/yt-dlp.git"
 DEPENDENCIES_DIR = os.path.join(BINARIES_DIR, "dependencies")
 AMF_SOURCE_DIR = os.path.join(DEPENDENCIES_DIR, "AMF")
+LAME_SOURCE_DIR = os.path.join(DEPENDENCIES_DIR, "LAME")
 NV_CODEC_HEADERS_DIR = os.path.join(DEPENDENCIES_DIR, "nv-codec-headers")
 LIBVPL_SOURCE_DIR = os.path.join(DEPENDENCIES_DIR, "libvpl")
 LIBVPL_BUILD_DIR = os.path.join(DEPENDENCIES_DIR, "libvpl-build")
-LAME_SOURCE_DIR = os.path.join(DEPENDENCIES_DIR, "LAME")
 DEPENDENCY_PREFIX_DIR = os.path.join(DEPENDENCIES_DIR, "local")
 FFMPEG_BUILD_MARKER = os.path.join(FFMPEG_OUTPUT_DIR, ".downloader-build-profile.json")
 FFMPEG_CONFIGURE_LOG = os.path.join(FFMPEG_OUTPUT_DIR, "configure.log")
@@ -63,6 +66,7 @@ DEFAULT_CONFIG = {
     "download_playlist": True,
     "use_ytdlp_audio_conversion": True,
     "embed_metadata": False,
+    "ytdlp_cookies_browser": "none",
 }
 
 
@@ -207,6 +211,11 @@ def _validated_config(raw: object) -> dict:
     embed_metadata = raw.get("embed_metadata")
     if isinstance(embed_metadata, bool):
         config["embed_metadata"] = embed_metadata
+    cookies_browser = raw.get("ytdlp_cookies_browser")
+    if isinstance(cookies_browser, str) and cookies_browser.casefold() in {
+        "none", "chrome", "edge", "firefox", "brave", "opera", "vivaldi",
+    }:
+        config["ytdlp_cookies_browser"] = cookies_browser.casefold()
     return config
 
 
@@ -274,29 +283,15 @@ def _ffmpeg_source_checkout_exists() -> bool:
     return os.path.isfile(os.path.join(FFMPEG_SOURCE_DIR, "configure"))
 
 
-def _windows_ffmpeg_toolchain_preference() -> str:
-    requested = os.environ.get("DOWNLOADER_FFMPEG_TOOLCHAIN", "auto").strip().lower()
-    return requested if requested in {"auto", "msvc", "msys2"} else "invalid"
-
-
 def _ffmpeg_build_profile_ready() -> bool:
     try:
         with open(FFMPEG_BUILD_MARKER, "r", encoding="utf-8") as handle:
             data = json.load(handle)
-        if not (
+        return (
             isinstance(data, dict)
             and data.get("profile") == FFMPEG_BUILD_PROFILE
             and data.get("platform") == sys.platform
-        ):
-            return False
-        if sys.platform == "win32":
-            built_with = data.get("windows_toolchain")
-            requested = _windows_ffmpeg_toolchain_preference()
-            if built_with not in {"msvc", "msys2"}:
-                return False
-            if requested != "auto" and requested != built_with:
-                return False
-        return True
+        )
     except Exception:
         return False
 
@@ -304,11 +299,8 @@ def _ffmpeg_build_profile_ready() -> bool:
 def _write_ffmpeg_build_profile() -> None:
     os.makedirs(FFMPEG_OUTPUT_DIR, exist_ok=True)
     temporary = FFMPEG_BUILD_MARKER + ".tmp"
-    profile = {"profile": FFMPEG_BUILD_PROFILE, "platform": sys.platform}
-    if sys.platform == "win32" and WINDOWS_FFMPEG_BUILD_TOOLCHAIN:
-        profile["windows_toolchain"] = WINDOWS_FFMPEG_BUILD_TOOLCHAIN
     with open(temporary, "w", encoding="utf-8") as handle:
-        json.dump(profile, handle, indent=2)
+        json.dump({"profile": FFMPEG_BUILD_PROFILE, "platform": sys.platform}, handle, indent=2)
         handle.write("\n")
     os.replace(temporary, FFMPEG_BUILD_MARKER)
 
@@ -402,6 +394,63 @@ def find_ffmpeg_executable(name: str) -> Optional[str]:
 def _ytdlp_source_main() -> Optional[str]:
     path = os.path.join(YTDLP_SOURCE_DIR, "yt_dlp", "__main__.py")
     return os.path.abspath(path) if os.path.isfile(path) else None
+
+
+def _ytdlp_environment() -> tuple[dict[str, str], str]:
+    environment = os.environ.copy()
+    bases = (
+        environment.get("LOCALAPPDATA"),
+        environment.get("XDG_CACHE_HOME"),
+        environment.get("TEMP"),
+        environment.get("TMP"),
+        tempfile.gettempdir(),
+    )
+    for base in bases:
+        if not base:
+            continue
+        candidate = os.path.abspath(os.path.join(base, YTDLP_TEMP_DIR_NAME))
+        try:
+            os.makedirs(candidate, exist_ok=True)
+            if os.access(candidate, os.W_OK):
+                environment["TEMP"] = candidate
+                environment["TMP"] = candidate
+                return environment, candidate
+        except OSError:
+            continue
+    raise OSError("Could not create a writable temporary directory for yt-dlp")
+
+
+def _prune_ytdlp_checkout() -> None:
+    allowed_root_entries = {".git", "yt_dlp"}
+    for name in os.listdir(YTDLP_SOURCE_DIR):
+        if name in allowed_root_entries:
+            continue
+        path = os.path.join(YTDLP_SOURCE_DIR, name)
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path)
+        else:
+            os.remove(path)
+    for relative_path in (
+        os.path.join("yt_dlp", "__pyinstaller"),
+        os.path.join("yt_dlp", "extractor", "youtube", "jsc", "README.md"),
+        os.path.join("yt_dlp", "extractor", "youtube", "pot", "README.md"),
+    ):
+        path = os.path.join(YTDLP_SOURCE_DIR, relative_path)
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+        elif os.path.isfile(path):
+            os.remove(path)
+
+
+def _ytdlp_is_standalone_git_checkout(git: str) -> bool:
+    code, output = _run_update_command(
+        [git, "rev-parse", "--show-toplevel"], cwd=YTDLP_SOURCE_DIR, timeout=15,
+    )
+    if code != 0:
+        return False
+    return os.path.normcase(os.path.abspath(output.strip())) == os.path.normcase(
+        os.path.abspath(YTDLP_SOURCE_DIR),
+    )
 
 
 def find_ytdlp_executable() -> Optional[str]:
@@ -733,6 +782,256 @@ def _find_windows_msys2() -> tuple[Optional[str], Optional[str], Optional[str]]:
     return None, None, None
 
 
+def _windows_ffmpeg_toolchain_preference() -> str:
+    requested = os.environ.get("DOWNLOADER_FFMPEG_TOOLCHAIN", "auto").strip().lower()
+    return requested if requested in {"auto", "msvc", "msys2"} else "invalid"
+
+def _find_windows_msvc_environment(log=None) -> Optional[dict[str, str]]:
+    """Return a fully initialized x64 MSVC environment, loading vcvars if needed."""
+    env = os.environ.copy()
+    existing_tools = all(
+        shutil.which(name, path=env.get("PATH"))
+        for name in ("cl.exe", "link.exe", "nmake.exe")
+    )
+    target_arch = env.get("VSCMD_ARG_TGT_ARCH", "").strip().lower()
+    compiler_path = shutil.which("cl.exe", path=env.get("PATH")) or ""
+    compiler_is_x64 = bool(re.search(r"(?i)\\Host(?:x64|x86)\\x64\\", compiler_path))
+    if existing_tools and (target_arch in {"x64", "amd64"} or compiler_is_x64):
+        return env
+
+    program_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+    vswhere_candidates = [
+        os.path.join(program_files_x86, "Microsoft Visual Studio", "Installer", "vswhere.exe"),
+    ]
+    vswhere = next((item for item in vswhere_candidates if os.path.isfile(item)), None)
+    installations: list[str] = []
+    if vswhere:
+        try:
+            result = subprocess.run(
+                [vswhere, "-latest", "-products", "*", "-requires",
+                 "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=15, check=False,
+            )
+            if result.returncode == 0:
+                installations.extend(line.strip() for line in result.stdout.splitlines() if line.strip())
+        except Exception:
+            pass
+
+    for key in ("VSINSTALLDIR",):
+        value = os.environ.get(key)
+        if value:
+            installations.append(value)
+    vc_install = os.environ.get("VCINSTALLDIR")
+    if vc_install:
+        installations.append(os.path.dirname(os.path.normpath(vc_install)))
+
+    for year in ("2022", "2019"):
+        for edition in ("BuildTools", "Community", "Professional", "Enterprise"):
+            installations.append(os.path.join(
+                os.environ.get("ProgramFiles", r"C:\Program Files"),
+                "Microsoft Visual Studio", year, edition,
+            ))
+
+    seen: set[str] = set()
+    vcvars_candidates: list[str] = []
+    for installation in installations:
+        normalized = os.path.normcase(os.path.abspath(installation))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        if os.path.basename(normalized).lower() == "vc":
+            candidate = os.path.join(installation, "Auxiliary", "Build", "vcvars64.bat")
+        else:
+            candidate = os.path.join(installation, "VC", "Auxiliary", "Build", "vcvars64.bat")
+        if os.path.isfile(candidate):
+            vcvars_candidates.append(candidate)
+
+    if not vcvars_candidates:
+        return None
+
+    cmd_exe = shutil.which("cmd.exe", path=env.get("PATH")) or os.path.join(
+        os.environ.get("SystemRoot", r"C:\Windows"), "System32", "cmd.exe"
+    )
+    for vcvars in vcvars_candidates:
+        batch_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".bat", prefix="downloader-vcvars-",
+                encoding="utf-8", newline="\r\n", delete=False,
+            ) as batch:
+                batch_path = batch.name
+                batch.write(f'@echo off\r\ncall "{vcvars}" >nul\r\n')
+                batch.write('if errorlevel 1 exit /b %errorlevel%\r\n')
+                batch.write("set\r\n")
+            result = subprocess.run(
+                [cmd_exe, "/d", "/c", batch_path], env=env,
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=60, check=False,
+            )
+            if result.returncode != 0:
+                continue
+            loaded = env.copy()
+            for line in result.stdout.splitlines():
+                key, separator, value = line.partition("=")
+                if separator and key and not key.startswith("="):
+                    loaded[key] = value
+            if all(shutil.which(name, path=loaded.get("PATH")) for name in ("cl.exe", "link.exe", "nmake.exe")):
+                if log:
+                    log(f"Loaded Visual Studio x64 build environment from: {vcvars}")
+                return loaded
+        except Exception as exc:
+            if log:
+                log(f"WARNING: Could not initialize the Visual Studio build environment: {exc}")
+        finally:
+            if batch_path:
+                try:
+                    os.remove(batch_path)
+                except OSError:
+                    pass
+    return None
+
+def _find_windows_non_msys_bash() -> tuple[Optional[str], Optional[str]]:
+    """Find Git Bash (or Cygwin Bash), deliberately excluding MSYS2."""
+    roots: list[str] = []
+    for value in (
+        os.environ.get("GIT_FOR_WINDOWS_HOME"),
+        r"C:\Program Files\Git",
+        r"C:\Program Files (x86)\Git",
+        r"C:\tools\Git",
+        r"C:\cygwin64",
+    ):
+        if value and value not in roots:
+            roots.append(value)
+    bash_candidates: list[tuple[str, str]] = []
+    for root in roots:
+        for relative in (os.path.join("bin", "bash.exe"), os.path.join("usr", "bin", "bash.exe"),
+                         os.path.join("bin", "bash")):
+            candidate = os.path.join(root, relative)
+            if os.path.isfile(candidate):
+                bash_candidates.append((os.path.abspath(candidate), os.path.abspath(os.path.join(root, "usr", "bin"))))
+    path_bash = shutil.which("bash.exe") or shutil.which("bash")
+    if path_bash and not re.search(r"(?i)\\msys(?:32|64|2)?\\", os.path.normpath(path_bash)):
+        normalized_bash = os.path.normpath(path_bash)
+        if re.search(r"(?i)\\usr\\bin\\bash(?:\.exe)?$", normalized_bash):
+            root = os.path.dirname(os.path.dirname(os.path.dirname(normalized_bash)))
+            usr_bin = os.path.dirname(normalized_bash)
+        else:
+            root = os.path.dirname(os.path.dirname(normalized_bash))
+            usr_bin = os.path.join(root, "usr", "bin")
+        bash_candidates.append((os.path.abspath(path_bash), os.path.abspath(usr_bin)))
+    for bash, usr_bin in bash_candidates:
+        if re.search(r"(?i)\\msys(?:32|64|2)?\\", bash):
+            continue
+        return bash, usr_bin
+    return None, None
+
+def _find_windows_gnu_make(env: dict[str, str], git_usr_bin: Optional[str]) -> Optional[str]:
+    candidates: list[str] = []
+    explicit = os.environ.get("DOWNLOADER_GNU_MAKE")
+    if explicit:
+        candidates.append(explicit)
+    if git_usr_bin:
+        candidates.append(os.path.join(git_usr_bin, "make.exe"))
+    path = env.get("PATH", "")
+    for name in ("make.exe", "make"):
+        found = shutil.which(name, path=path)
+        if found:
+            candidates.append(found)
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not candidate:
+            continue
+        normalized = os.path.normcase(os.path.abspath(candidate))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        if not os.path.isfile(candidate):
+            continue
+        # The MSVC route must not silently depend on make installed under MSYS2.
+        if re.search(r"(?i)\\msys(?:32|64|2)?\\", os.path.normpath(candidate)):
+            continue
+        return os.path.abspath(candidate)
+    return None
+
+def _find_windows_msvc_build_tools(log=None) -> Optional[tuple[str, str, dict[str, str], str]]:
+    env = _find_windows_msvc_environment(log)
+    if not env:
+        return None
+    bash, git_usr_bin = _find_windows_non_msys_bash()
+    if not bash:
+        return None
+    make = _find_windows_gnu_make(env, git_usr_bin)
+    if not make:
+        return None
+    # Keep the Visual Studio linker ahead of Git Bash utilities: Git may ship
+    # a coreutils executable named link.exe which must not shadow MSVC LINK.
+    msvc_tool_dirs = []
+    for executable in ("cl.exe", "link.exe", "nmake.exe"):
+        found = shutil.which(executable, path=env.get("PATH"))
+        if found:
+            directory = os.path.dirname(found)
+            if directory not in msvc_tool_dirs:
+                msvc_tool_dirs.append(directory)
+    path_parts = msvc_tool_dirs + [os.path.dirname(make), git_usr_bin]
+    env["PATH"] = os.pathsep.join(
+        [part for part in path_parts if part] + [env.get("PATH", "")]
+    )
+    if not all(shutil.which(name, path=env.get("PATH")) for name in ("cl.exe", "link.exe", "nmake.exe")):
+        return None
+    return bash, make, env, git_usr_bin
+
+def _prepare_msvc_lame(workspace: str, env: dict[str, str], log) -> Optional[tuple[str, str, str]]:
+    """Build a matching x64 LAME DLL/import library with the active MSVC toolchain."""
+    if not _prepare_git_dependency(
+        LAME_SOURCE_DIR, "https://github.com/lameproject/lame.git",
+        "Makefile.MSVC", "LAME MP3 encoder source", log,
+    ):
+        log("ERROR: Could not prepare the MSVC-compatible LAME source required for MP3 encoding.")
+        return None
+    nmake = shutil.which("nmake.exe", path=env.get("PATH")) or shutil.which("nmake", path=env.get("PATH"))
+    if not nmake:
+        log("ERROR: NMAKE was not found in the initialized Visual Studio environment.")
+        return None
+    log("Building the required LAME MP3 encoder with MSVC (x64, no external assembler)...")
+    command = [
+        nmake, "/nologo", "/f", "Makefile.MSVC", "libmp3lame.dll",
+        "MSVCVER=Win64", "MACHINE=/machine:X64", "ASM=NO",
+    ]
+    if _run_streamed_process(command, log, cwd=LAME_SOURCE_DIR, env=env) != 0:
+        log("ERROR: LAME could not be built with this MSVC toolset; MP3 encoding remains required by this application.")
+        return None
+
+    output_dir = os.path.join(LAME_SOURCE_DIR, "output")
+    header_candidates = (
+        os.path.join(LAME_SOURCE_DIR, "include", "lame", "lame.h"),
+        os.path.join(LAME_SOURCE_DIR, "include", "lame.h"),
+    )
+    header = next((item for item in header_candidates if os.path.isfile(item)), None)
+    import_library = os.path.join(output_dir, "libmp3lame.lib")
+    runtime_dll = os.path.join(output_dir, "libmp3lame.dll")
+    if not header or not os.path.isfile(import_library) or not os.path.isfile(runtime_dll):
+        log(
+            "ERROR: The MSVC LAME build did not produce its expected header, "
+            "libmp3lame.lib import library, and libmp3lame.dll runtime."
+        )
+        return None
+
+    staged_root = os.path.join(workspace, "_downloader_deps", "lame")
+    include_dir = os.path.join(staged_root, "include")
+    lib_dir = os.path.join(staged_root, "lib")
+    try:
+        os.makedirs(os.path.join(include_dir, "lame"), exist_ok=True)
+        os.makedirs(lib_dir, exist_ok=True)
+        shutil.copy2(header, os.path.join(include_dir, "lame", "lame.h"))
+        shutil.copy2(import_library, os.path.join(lib_dir, "libmp3lame.lib"))
+    except OSError as exc:
+        log(f"ERROR: Could not stage the MSVC LAME headers/library: {exc}")
+        return None
+    log("MSVC-compatible libmp3lame.lib and libmp3lame.dll are ready.")
+    return ("_downloader_deps/lame/include", "_downloader_deps/lame/lib", runtime_dll)
+
+
 def _git_checkout_ready(path: str, required_relpath: str) -> bool:
     return os.path.isfile(os.path.join(path, *required_relpath.split("/")))
 
@@ -1032,259 +1331,6 @@ def _log_configure_failure_tail(path: Optional[str], log, max_lines: int = 80) -
         text = line.rstrip()
         if text:
             log(f"[configure.log] {text}")
-    log("--- end configure.log tail ---")
-
-
-def _find_windows_msvc_environment(log=None) -> Optional[dict[str, str]]:
-    """Return a fully initialized x64 MSVC environment, loading vcvars if needed."""
-    env = os.environ.copy()
-    existing_tools = all(
-        shutil.which(name, path=env.get("PATH"))
-        for name in ("cl.exe", "link.exe", "nmake.exe")
-    )
-    target_arch = env.get("VSCMD_ARG_TGT_ARCH", "").strip().lower()
-    compiler_path = shutil.which("cl.exe", path=env.get("PATH")) or ""
-    compiler_is_x64 = bool(re.search(r"(?i)\\Host(?:x64|x86)\\x64\\", compiler_path))
-    if existing_tools and (target_arch in {"x64", "amd64"} or compiler_is_x64):
-        return env
-
-    program_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
-    vswhere_candidates = [
-        os.path.join(program_files_x86, "Microsoft Visual Studio", "Installer", "vswhere.exe"),
-    ]
-    vswhere = next((item for item in vswhere_candidates if os.path.isfile(item)), None)
-    installations: list[str] = []
-    if vswhere:
-        try:
-            result = subprocess.run(
-                [vswhere, "-latest", "-products", "*", "-requires",
-                 "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"],
-                capture_output=True, text=True, encoding="utf-8", errors="replace",
-                timeout=15, check=False,
-            )
-            if result.returncode == 0:
-                installations.extend(line.strip() for line in result.stdout.splitlines() if line.strip())
-        except Exception:
-            pass
-
-    for key in ("VSINSTALLDIR",):
-        value = os.environ.get(key)
-        if value:
-            installations.append(value)
-    vc_install = os.environ.get("VCINSTALLDIR")
-    if vc_install:
-        installations.append(os.path.dirname(os.path.normpath(vc_install)))
-
-    for year in ("2022", "2019"):
-        for edition in ("BuildTools", "Community", "Professional", "Enterprise"):
-            installations.append(os.path.join(
-                os.environ.get("ProgramFiles", r"C:\Program Files"),
-                "Microsoft Visual Studio", year, edition,
-            ))
-
-    seen: set[str] = set()
-    vcvars_candidates: list[str] = []
-    for installation in installations:
-        normalized = os.path.normcase(os.path.abspath(installation))
-        if normalized in seen:
-            continue
-        seen.add(normalized)
-        if os.path.basename(normalized).lower() == "vc":
-            candidate = os.path.join(installation, "Auxiliary", "Build", "vcvars64.bat")
-        else:
-            candidate = os.path.join(installation, "VC", "Auxiliary", "Build", "vcvars64.bat")
-        if os.path.isfile(candidate):
-            vcvars_candidates.append(candidate)
-
-    if not vcvars_candidates:
-        return None
-
-    cmd_exe = shutil.which("cmd.exe", path=env.get("PATH")) or os.path.join(
-        os.environ.get("SystemRoot", r"C:\Windows"), "System32", "cmd.exe"
-    )
-    for vcvars in vcvars_candidates:
-        batch_path = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".bat", prefix="downloader-vcvars-",
-                encoding="utf-8", newline="\r\n", delete=False,
-            ) as batch:
-                batch_path = batch.name
-                batch.write(f'@echo off\r\ncall "{vcvars}" >nul\r\n')
-                batch.write('if errorlevel 1 exit /b %errorlevel%\r\n')
-                batch.write("set\r\n")
-            result = subprocess.run(
-                [cmd_exe, "/d", "/c", batch_path], env=env,
-                capture_output=True, text=True, encoding="utf-8", errors="replace",
-                timeout=60, check=False,
-            )
-            if result.returncode != 0:
-                continue
-            loaded = env.copy()
-            for line in result.stdout.splitlines():
-                key, separator, value = line.partition("=")
-                if separator and key and not key.startswith("="):
-                    loaded[key] = value
-            if all(shutil.which(name, path=loaded.get("PATH")) for name in ("cl.exe", "link.exe", "nmake.exe")):
-                if log:
-                    log(f"Loaded Visual Studio x64 build environment from: {vcvars}")
-                return loaded
-        except Exception as exc:
-            if log:
-                log(f"WARNING: Could not initialize the Visual Studio build environment: {exc}")
-        finally:
-            if batch_path:
-                try:
-                    os.remove(batch_path)
-                except OSError:
-                    pass
-    return None
-
-
-def _find_windows_non_msys_bash() -> tuple[Optional[str], Optional[str]]:
-    """Find Git Bash (or Cygwin Bash), deliberately excluding MSYS2."""
-    roots: list[str] = []
-    for value in (
-        os.environ.get("GIT_FOR_WINDOWS_HOME"),
-        r"C:\Program Files\Git",
-        r"C:\Program Files (x86)\Git",
-        r"C:\tools\Git",
-        r"C:\cygwin64",
-    ):
-        if value and value not in roots:
-            roots.append(value)
-    bash_candidates: list[tuple[str, str]] = []
-    for root in roots:
-        for relative in (os.path.join("bin", "bash.exe"), os.path.join("usr", "bin", "bash.exe"),
-                         os.path.join("bin", "bash")):
-            candidate = os.path.join(root, relative)
-            if os.path.isfile(candidate):
-                bash_candidates.append((os.path.abspath(candidate), os.path.abspath(os.path.join(root, "usr", "bin"))))
-    path_bash = shutil.which("bash.exe") or shutil.which("bash")
-    if path_bash and not re.search(r"(?i)\\msys(?:32|64|2)?\\", os.path.normpath(path_bash)):
-        normalized_bash = os.path.normpath(path_bash)
-        if re.search(r"(?i)\\usr\\bin\\bash(?:\.exe)?$", normalized_bash):
-            root = os.path.dirname(os.path.dirname(os.path.dirname(normalized_bash)))
-            usr_bin = os.path.dirname(normalized_bash)
-        else:
-            root = os.path.dirname(os.path.dirname(normalized_bash))
-            usr_bin = os.path.join(root, "usr", "bin")
-        bash_candidates.append((os.path.abspath(path_bash), os.path.abspath(usr_bin)))
-    for bash, usr_bin in bash_candidates:
-        if re.search(r"(?i)\\msys(?:32|64|2)?\\", bash):
-            continue
-        return bash, usr_bin
-    return None, None
-
-
-def _find_windows_gnu_make(env: dict[str, str], git_usr_bin: Optional[str]) -> Optional[str]:
-    candidates: list[str] = []
-    explicit = os.environ.get("DOWNLOADER_GNU_MAKE")
-    if explicit:
-        candidates.append(explicit)
-    if git_usr_bin:
-        candidates.append(os.path.join(git_usr_bin, "make.exe"))
-    path = env.get("PATH", "")
-    for name in ("make.exe", "make"):
-        found = shutil.which(name, path=path)
-        if found:
-            candidates.append(found)
-    seen: set[str] = set()
-    for candidate in candidates:
-        if not candidate:
-            continue
-        normalized = os.path.normcase(os.path.abspath(candidate))
-        if normalized in seen:
-            continue
-        seen.add(normalized)
-        if not os.path.isfile(candidate):
-            continue
-        # The MSVC route must not silently depend on make installed under MSYS2.
-        if re.search(r"(?i)\\msys(?:32|64|2)?\\", os.path.normpath(candidate)):
-            continue
-        return os.path.abspath(candidate)
-    return None
-
-
-def _find_windows_msvc_build_tools(log=None) -> Optional[tuple[str, str, dict[str, str], str]]:
-    env = _find_windows_msvc_environment(log)
-    if not env:
-        return None
-    bash, git_usr_bin = _find_windows_non_msys_bash()
-    if not bash:
-        return None
-    make = _find_windows_gnu_make(env, git_usr_bin)
-    if not make:
-        return None
-    # Keep the Visual Studio linker ahead of Git Bash utilities: Git may ship
-    # a coreutils executable named link.exe which must not shadow MSVC LINK.
-    msvc_tool_dirs = []
-    for executable in ("cl.exe", "link.exe", "nmake.exe"):
-        found = shutil.which(executable, path=env.get("PATH"))
-        if found:
-            directory = os.path.dirname(found)
-            if directory not in msvc_tool_dirs:
-                msvc_tool_dirs.append(directory)
-    path_parts = msvc_tool_dirs + [os.path.dirname(make), git_usr_bin]
-    env["PATH"] = os.pathsep.join(
-        [part for part in path_parts if part] + [env.get("PATH", "")]
-    )
-    if not all(shutil.which(name, path=env.get("PATH")) for name in ("cl.exe", "link.exe", "nmake.exe")):
-        return None
-    return bash, make, env, git_usr_bin
-
-
-def _prepare_msvc_lame(workspace: str, env: dict[str, str], log) -> Optional[tuple[str, str, str]]:
-    """Build a matching x64 LAME DLL/import library with the active MSVC toolchain."""
-    if not _prepare_git_dependency(
-        LAME_SOURCE_DIR, "https://github.com/lameproject/lame.git",
-        "Makefile.MSVC", "LAME MP3 encoder source", log,
-    ):
-        log("ERROR: Could not prepare the MSVC-compatible LAME source required for MP3 encoding.")
-        return None
-    nmake = shutil.which("nmake.exe", path=env.get("PATH")) or shutil.which("nmake", path=env.get("PATH"))
-    if not nmake:
-        log("ERROR: NMAKE was not found in the initialized Visual Studio environment.")
-        return None
-    log("Building the required LAME MP3 encoder with MSVC (x64, no external assembler)...")
-    command = [
-        nmake, "/nologo", "/f", "Makefile.MSVC", "libmp3lame.dll",
-        "MSVCVER=Win64", "MACHINE=/machine:X64", "ASM=NO",
-    ]
-    if _run_streamed_process(command, log, cwd=LAME_SOURCE_DIR, env=env) != 0:
-        log("ERROR: LAME could not be built with this MSVC toolset; MP3 encoding remains required by this application.")
-        return None
-
-    output_dir = os.path.join(LAME_SOURCE_DIR, "output")
-    header_candidates = (
-        os.path.join(LAME_SOURCE_DIR, "include", "lame", "lame.h"),
-        os.path.join(LAME_SOURCE_DIR, "include", "lame.h"),
-    )
-    header = next((item for item in header_candidates if os.path.isfile(item)), None)
-    import_library = os.path.join(output_dir, "libmp3lame.lib")
-    runtime_dll = os.path.join(output_dir, "libmp3lame.dll")
-    if not header or not os.path.isfile(import_library) or not os.path.isfile(runtime_dll):
-        log(
-            "ERROR: The MSVC LAME build did not produce its expected header, "
-            "libmp3lame.lib import library, and libmp3lame.dll runtime."
-        )
-        return None
-
-    staged_root = os.path.join(workspace, "_downloader_deps", "lame")
-    include_dir = os.path.join(staged_root, "include")
-    lib_dir = os.path.join(staged_root, "lib")
-    try:
-        os.makedirs(os.path.join(include_dir, "lame"), exist_ok=True)
-        os.makedirs(lib_dir, exist_ok=True)
-        shutil.copy2(header, os.path.join(include_dir, "lame", "lame.h"))
-        shutil.copy2(import_library, os.path.join(lib_dir, "libmp3lame.lib"))
-    except OSError as exc:
-        log(f"ERROR: Could not stage the MSVC LAME headers/library: {exc}")
-        return None
-    log("MSVC-compatible libmp3lame.lib and libmp3lame.dll are ready.")
-    return ("_downloader_deps/lame/include", "_downloader_deps/lame/lib", runtime_dll)
-
-
 def _build_ffmpeg_windows(log) -> bool:
     global WINDOWS_FFMPEG_BUILD_TOOLCHAIN
     preference = _windows_ffmpeg_toolchain_preference()
@@ -2232,26 +2278,56 @@ def update_ytdlp_installation() -> tuple[bool, list[str]]:
     messages: list[str] = []
     source_main = _ytdlp_source_main()
     if source_main:
-        messages.append(f"Using cloned yt-dlp source checkout: {YTDLP_SOURCE_DIR}")
         git = shutil.which("git")
-        git_dir = os.path.join(YTDLP_SOURCE_DIR, ".git")
-        if git and os.path.isdir(git_dir):
-            code, output = _run_update_command(
-                [git, "pull", "--ff-only"], timeout=180, cwd=YTDLP_SOURCE_DIR,
-            )
-            messages.append("yt-dlp source update: git pull --ff-only")
-            if output:
-                messages.extend(line for line in output.splitlines() if line.strip())
-            if code != 0:
-                messages.append(
-                    "WARNING: The yt-dlp source checkout could not be updated; "
-                    "the existing checkout will still be tested and used."
+        if not git:
+            messages.append("WARNING: Git was not found on PATH, so yt-dlp could not be updated.")
+        else:
+            messages.append("Checking yt-dlp for updates...")
+            temp_root = tempfile.mkdtemp(prefix="yt-dlp-update-", dir=tempfile.gettempdir())
+            staged_dir = os.path.join(temp_root, "source")
+            backup_dir = os.path.join(temp_root, "current")
+            try:
+                code, output = _run_update_command(
+                    [git, "clone", "--depth", "1", YTDLP_GIT_URL, staged_dir],
+                    timeout=900,
                 )
-        elif not git:
-            messages.append(
-                "WARNING: Git was not found on PATH, so the cloned yt-dlp checkout "
-                "could not be updated automatically."
-            )
+                if output:
+                    messages.extend(line for line in output.splitlines() if line.strip())
+                staged_package = os.path.join(staged_dir, "yt_dlp")
+                if code != 0 or not os.path.isfile(os.path.join(staged_package, "__main__.py")):
+                    messages.append("WARNING: Could not download the latest yt-dlp runtime; using the existing checkout.")
+                else:
+                    new_version_code, new_version = _run_update_command(
+                        [sys.executable, os.path.join(staged_package, "__main__.py"), "--version"],
+                        timeout=30,
+                    )
+                    current_version_code, current_version = _run_update_command(
+                        [sys.executable, source_main, "--version"], timeout=30,
+                    )
+                    new_version = new_version.strip().splitlines()[-1] if new_version.strip() else "unknown"
+                    current_version = current_version.strip().splitlines()[-1] if current_version.strip() else "unknown"
+                    if new_version_code == 0 and current_version_code == 0 and new_version == current_version:
+                        messages.append(f"yt-dlp is already up to date at {current_version}.")
+                    else:
+                        replacement = os.path.join(temp_root, "yt_dlp")
+                        shutil.copytree(staged_package, replacement)
+                        current_package = os.path.join(YTDLP_SOURCE_DIR, "yt_dlp")
+                        os.replace(current_package, backup_dir)
+                        try:
+                            os.replace(replacement, current_package)
+                        except Exception:
+                            os.replace(backup_dir, current_package)
+                            raise
+                        shutil.rmtree(backup_dir, ignore_errors=True)
+                        messages.append(f"yt-dlp runtime updated: {current_version} -> {new_version}.")
+            except (OSError, shutil.Error) as exc:
+                messages.append(f"WARNING: Could not update yt-dlp runtime: {exc}")
+            finally:
+                shutil.rmtree(temp_root, ignore_errors=True)
+        try:
+            _prune_ytdlp_checkout()
+        except OSError as exc:
+            messages.append(f"WARNING: Could not prune yt-dlp checkout: {exc}")
         verify_code, version_output = _run_update_command(
             [sys.executable, source_main, "--version"], timeout=30,
         )
@@ -2293,6 +2369,98 @@ def update_ytdlp_installation() -> tuple[bool, list[str]]:
     if version_output:
         messages.append(f"Installed yt-dlp version: {version_output.splitlines()[-1]}")
     return verify_code == 0 or get_ytdlp_command() is not None, messages
+
+
+def _app_git_checkout(git: str) -> bool:
+    code, output = _run_update_command(
+        [git, "rev-parse", "--show-toplevel"], cwd=APP_SOURCE_DIR, timeout=15,
+    )
+    return code == 0 and os.path.normcase(os.path.abspath(output.strip())) == os.path.normcase(
+        os.path.abspath(APP_SOURCE_DIR),
+    )
+
+
+def check_app_update_available(log) -> tuple[bool, bool, str]:
+    git = shutil.which("git")
+    if not git or not _app_git_checkout(git):
+        message = "The application folder is not a Git checkout, so app updates cannot be checked."
+        log(f"WARNING: {message}")
+        return False, False, message
+    branch_code, branch_output = _run_update_command(
+        [git, "branch", "--show-current"], cwd=APP_SOURCE_DIR, timeout=15,
+    )
+    branch = branch_output.strip()
+    if branch != "main":
+        message = f"Application updates target main, but this checkout is on {branch or 'detached HEAD'}; leaving it unchanged."
+        log(message)
+        return True, False, message
+    fetch_code, fetch_output = _run_update_command(
+        [git, "fetch", "--quiet", "--prune", "origin", "main"], cwd=APP_SOURCE_DIR, timeout=120,
+    )
+    if fetch_code != 0:
+        message = "Could not check the application repository for updates."
+        log(f"WARNING: {message}")
+        if fetch_output:
+            log(f"[app-git] {fetch_output.splitlines()[-1]}")
+        return False, False, message
+    head_code, head_output = _run_update_command(
+        [git, "rev-parse", "HEAD"], cwd=APP_SOURCE_DIR, timeout=15,
+    )
+    remote_code, remote_output = _run_update_command(
+        [git, "rev-parse", "origin/main"], cwd=APP_SOURCE_DIR, timeout=15,
+    )
+    if head_code != 0 or remote_code != 0:
+        message = "Could not determine the current or remote application revision."
+        log(f"WARNING: {message}")
+        return False, False, message
+    head = head_output.strip()[:12]
+    remote = remote_output.strip()[:12]
+    if head == remote:
+        message = f"Application is up to date at {head}."
+        log(message)
+        return True, False, message
+    ancestor_code, _ = _run_update_command(
+        [git, "merge-base", "--is-ancestor", "HEAD", "origin/main"],
+        cwd=APP_SOURCE_DIR, timeout=15,
+    )
+    if ancestor_code == 0:
+        message = f"Application update is available: {head} -> {remote}."
+        log(message)
+        return True, True, message
+    message = "Application checkout has diverged from origin/main; leaving it unchanged."
+    log(f"WARNING: {message}")
+    return False, False, message
+
+
+def update_app_source_checkout(log) -> tuple[bool, bool, str]:
+    git = shutil.which("git")
+    if not git or not _app_git_checkout(git):
+        message = "The application folder is not a Git checkout, so app updates cannot be installed."
+        log(f"ERROR: {message}")
+        return False, False, message
+    branch_code, branch_output = _run_update_command(
+        [git, "branch", "--show-current"], cwd=APP_SOURCE_DIR, timeout=15,
+    )
+    branch = branch_output.strip()
+    if branch != "main":
+        message = f"Application updates target main, but this checkout is on {branch or 'detached HEAD'}."
+        log(f"WARNING: {message}")
+        return True, False, message
+    code, output = _run_update_command(
+        [git, "pull", "--ff-only", "origin", "main"], cwd=APP_SOURCE_DIR, timeout=180,
+    )
+    if output:
+        for line in output.splitlines():
+            if line.strip():
+                log(f"[app-git] {line}")
+    if code != 0:
+        message = "Application update failed; the existing checkout was left unchanged."
+        log(f"ERROR: {message}")
+        return False, False, message
+    changed = "Already up to date." not in output
+    message = "Application source was updated successfully." if changed else "Application is already up to date."
+    log(message)
+    return True, changed, message
 
 
 def parse_ffmpeg_component_names(output: str) -> set[str]:
@@ -2780,10 +2948,12 @@ class Worker(threading.Thread):
         if not command:
             return None
         try:
+            env, temp_dir = _ytdlp_environment()
             proc = subprocess.run(
                 [*command, url, "--dump-single-json", "--flat-playlist",
-                 "--no-warnings", "--yes-playlist"],
+                 "--no-warnings", "--yes-playlist", "--paths", f"temp:{temp_dir}"],
                 capture_output=True, text=True, timeout=45, check=False,
+                env=env,
             )
             if proc.returncode == 0:
                 data = json.loads(proc.stdout)
@@ -2859,6 +3029,21 @@ class Worker(threading.Thread):
             "--no-embed-subs", "--no-write-subs", "--no-write-auto-subs",
             "--yes-playlist" if playlist_enabled else "--no-playlist",
         ]
+        env, temp_dir = _ytdlp_environment()
+        cmd += ["--paths", f"temp:{temp_dir}"]
+        cookies_browser = str(self.opts.get("ytdlp_cookies_browser") or "none").casefold()
+        if cookies_browser != "none":
+            cmd += ["--cookies-from-browser", cookies_browser]
+            self.q.put((
+                "log",
+                f"yt-dlp will load YouTube cookies from the {cookies_browser} browser profile.",
+            ))
+        else:
+            self.q.put((
+                "log",
+                "yt-dlp browser cookies are disabled; if YouTube requests sign-in, "
+                "select a browser in Settings and retry.",
+            ))
         if playlist_enabled:
             # Skip unavailable playlist entries but continue downloading the rest.
             # ERROR lines are classified below so unrelated failures stay visible.
@@ -2981,7 +3166,7 @@ class Worker(threading.Thread):
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace",
-                bufsize=1, stdin=subprocess.DEVNULL,
+                bufsize=1, stdin=subprocess.DEVNULL, env=env,
             )
         except Exception as exc:
             self.q.put(("error", f"Failed to start yt-dlp: {exc}"))
@@ -4066,16 +4251,16 @@ class App:
         if self.startup_prepare_in_progress:
             parent = self.settings_window if self.settings_window is not None else self.root
             messagebox.showinfo(
-                "FFmpeg update",
-                "Startup tool preparation is still running. Try the FFmpeg update again after it finishes.",
+                "Tools & app update",
+                "Startup tool preparation is still running. Try the update again after it finishes.",
                 parent=parent,
             )
             return
         if self.worker is not None and self.worker.is_alive():
             parent = self.settings_window if self.settings_window is not None else self.root
             messagebox.showwarning(
-                "FFmpeg update",
-                "A download/conversion is currently running. Update FFmpeg after it finishes.",
+                "Tools & app update",
+                "A download/conversion is currently running. Update after it finishes.",
                 parent=parent,
             )
             return
@@ -4084,21 +4269,27 @@ class App:
             self.ffmpeg_update_button.configure(state="disabled")
         if self.ffmpeg_update_status_var is not None:
             self.ffmpeg_update_status_var.set("Checking for updates...")
-        self.status_var.set("Updating FFmpeg")
+        self.status_var.set("Updating tools and app")
         self.start_btn.configure(state="disabled")
-        self.log("Manual FFmpeg update requested from Settings.")
+        self.log("Manual tool and application update requested from Settings.")
         threading.Thread(target=self._ffmpeg_update_thread, daemon=True).start()
 
     def _ffmpeg_update_thread(self) -> None:
         def update_log(message: str) -> None:
             self.q.put(("log", message))
+        results: list[str] = []
+        overall_success = True
+        any_changed = False
+        rebuilt = False
         try:
             success, changed, summary = update_ffmpeg_source_checkout(update_log)
         except Exception as exc:
             success, changed = False, False
             summary = f"FFmpeg update failed unexpectedly: {exc}"
             update_log(f"ERROR: {summary}")
-        rebuilt = False
+        results.append(summary)
+        overall_success = overall_success and success
+        any_changed = any_changed or changed
         if success and changed:
             try:
                 rebuilt = ensure_ffmpeg_ready(update_log, force_rebuild=True)
@@ -4113,7 +4304,38 @@ class App:
                     "The log contains the build error; the app will retry the rebuild on the next startup."
                 )
                 success = False
-        self.q.put(("ffmpeg_update_done", success, changed, rebuilt, summary))
+                overall_success = False
+            if rebuilt:
+                results[-1] = "FFmpeg source was updated and rebuilt successfully."
+            else:
+                results[-1] = "FFmpeg source was updated, but rebuilding failed."
+        try:
+            ytdlp_success, ytdlp_messages = update_ytdlp_installation()
+            for message in ytdlp_messages:
+                update_log(message)
+            ytdlp_changed = any("runtime updated:" in message for message in ytdlp_messages)
+            any_changed = any_changed or ytdlp_changed
+            overall_success = overall_success and ytdlp_success
+            results.append(
+                "yt-dlp was updated successfully." if ytdlp_changed
+                else "yt-dlp is already up to date."
+                if ytdlp_success else "yt-dlp update failed."
+            )
+        except Exception as exc:
+            overall_success = False
+            results.append(f"yt-dlp update failed unexpectedly: {exc}")
+            update_log(f"ERROR: {results[-1]}")
+        try:
+            app_success, app_changed, app_summary = update_app_source_checkout(update_log)
+            overall_success = overall_success and app_success
+            any_changed = any_changed or app_changed
+            results.append(app_summary)
+        except Exception as exc:
+            overall_success = False
+            results.append(f"Application update failed unexpectedly: {exc}")
+            update_log(f"ERROR: {results[-1]}")
+        summary = "\n".join(results)
+        self.q.put(("ffmpeg_update_done", overall_success, any_changed, rebuilt, summary))
 
     def open_settings(self) -> None:
         if self.settings_window is not None and self.settings_window.winfo_exists():
@@ -4133,6 +4355,9 @@ class App:
         playlist_var = tk.StringVar(value="Yes" if self.settings["download_playlist"] else "No")
         ytdlp_audio_var = tk.BooleanVar(value=self.settings["use_ytdlp_audio_conversion"])
         embed_metadata_var = tk.BooleanVar(value=self.settings["embed_metadata"])
+        cookies_browser_var = tk.StringVar(
+            value=self.settings.get("ytdlp_cookies_browser", "none").title(),
+        )
 
         ttk.Label(content, text="Encoder backend:").grid(
             row=0, column=0, sticky="w", padx=(0, 12), pady=(0, 10),
@@ -4174,25 +4399,38 @@ class App:
             text="Embed thumbnail, metadata, and chapters (yt-dlp where supported; no subtitles)",
             variable=embed_metadata_var,
         ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(0, 14))
-        ttk.Separator(content, orient="horizontal").grid(
-            row=5, column=0, columnspan=3, sticky="ew", pady=(2, 12),
+        ttk.Label(content, text="YouTube cookies:").grid(
+            row=5, column=0, sticky="w", padx=(0, 12), pady=(0, 10),
         )
-        ttk.Label(content, text="FFmpeg update:").grid(
-            row=6, column=0, sticky="w", padx=(0, 12), pady=(0, 4),
+        cookies_browser_box = ttk.Combobox(
+            content, textvariable=cookies_browser_var,
+            values=("None", "Chrome", "Edge", "Firefox", "Brave", "Opera", "Vivaldi"),
+            state="readonly", width=18,
+        )
+        cookies_browser_box.grid(row=5, column=1, sticky="w", pady=(0, 10))
+        ttk.Label(
+            content,
+            text="Use a signed-in browser profile when YouTube blocks downloads.",
+        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(0, 10))
+        ttk.Separator(content, orient="horizontal").grid(
+            row=7, column=0, columnspan=3, sticky="ew", pady=(2, 12),
+        )
+        ttk.Label(content, text="Updates:").grid(
+            row=8, column=0, sticky="w", padx=(0, 12), pady=(0, 4),
         )
         self.ffmpeg_update_status_var = tk.StringVar(value="")
         self.ffmpeg_update_button = ttk.Button(
-            content, text="Check / Update FFmpeg",
+            content, text="Check / Update Tools & App",
             command=self._start_ffmpeg_update,
             state="disabled" if (self.startup_prepare_in_progress or self.ffmpeg_update_in_progress) else "normal",
         )
-        self.ffmpeg_update_button.grid(row=6, column=1, sticky="w", pady=(0, 4))
+        self.ffmpeg_update_button.grid(row=8, column=1, sticky="w", pady=(0, 4))
         ttk.Label(content, textvariable=self.ffmpeg_update_status_var).grid(
-            row=7, column=0, columnspan=3, sticky="w", pady=(0, 10),
+            row=9, column=0, columnspan=3, sticky="w", pady=(0, 10),
         )
         content.columnconfigure(1, weight=1)
         buttons = ttk.Frame(content)
-        buttons.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        buttons.grid(row=10, column=0, columnspan=3, sticky="ew", pady=(12, 0))
 
         def save_settings() -> None:
             directory = directory_var.get().strip()
@@ -4207,6 +4445,7 @@ class App:
                 "download_playlist": playlist_var.get() == "Yes",
                 "use_ytdlp_audio_conversion": bool(ytdlp_audio_var.get()),
                 "embed_metadata": bool(embed_metadata_var.get()),
+                "ytdlp_cookies_browser": cookies_browser_var.get().casefold(),
             }
             try:
                 save_config(new_settings)
@@ -4239,6 +4478,7 @@ class App:
             playlist_var.set("Yes" if DEFAULT_CONFIG["download_playlist"] else "No")
             ytdlp_audio_var.set(DEFAULT_CONFIG["use_ytdlp_audio_conversion"])
             embed_metadata_var.set(DEFAULT_CONFIG["embed_metadata"])
+            cookies_browser_var.set(DEFAULT_CONFIG["ytdlp_cookies_browser"].title())
 
         ttk.Button(buttons, text="Save", command=save_settings).pack(side="left")
         ttk.Button(buttons, text="Reset to Defaults", command=reset_fields).pack(side="right")
@@ -4519,6 +4759,7 @@ class App:
             "download_playlist": self.settings["download_playlist"],
             "use_ytdlp_audio_conversion": self.settings["use_ytdlp_audio_conversion"],
             "embed_metadata": self.settings["embed_metadata"],
+            "ytdlp_cookies_browser": self.settings["ytdlp_cookies_browser"],
         }
         self.status_var.set("Running")
         self.start_btn.configure(state="disabled")
@@ -4567,6 +4808,8 @@ class App:
                     if self.ffmpeg_update_status_var is not None:
                         if success and changed and rebuilt:
                             self.ffmpeg_update_status_var.set("Updated and rebuilt successfully")
+                        elif success and changed:
+                            self.ffmpeg_update_status_var.set("Updated successfully")
                         elif success and not changed:
                             self.ffmpeg_update_status_var.set("Already up to date")
                         else:
@@ -4579,9 +4822,9 @@ class App:
                         self.status_var.set("Tool setup failed")
                     parent = self.settings_window if self.settings_window is not None else self.root
                     if success:
-                        messagebox.showinfo("FFmpeg update", summary, parent=parent)
+                        messagebox.showinfo("Tools & app update", summary, parent=parent)
                     else:
-                        messagebox.showerror("FFmpeg update", summary, parent=parent)
+                        messagebox.showerror("Tools & app update", summary, parent=parent)
                 else:
                     self.log(f"Unknown queue message: {item}")
         except queue.Empty:
