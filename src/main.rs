@@ -484,6 +484,44 @@ fn video_codec_args(codec: &str) -> Vec<String> {
         _ => vec![],
     }
 }
+fn gpu_encoder_candidates(codec: &str, backend: &str) -> Vec<&'static str> {
+    match (backend, codec) {
+        ("AMD", "h264") => vec!["h264_vaapi", "h264_amf"],
+        ("AMD", "h265") => vec!["hevc_vaapi", "hevc_amf"],
+        ("AMD", "vp9") => vec!["vp9_vaapi"],
+        ("AMD", "av1") => vec!["av1_vaapi", "av1_amf"],
+        ("INTEL", "h264") => vec!["h264_qsv", "h264_vaapi"],
+        ("INTEL", "h265") => vec!["hevc_qsv", "hevc_vaapi"],
+        ("INTEL", "vp9") => vec!["vp9_qsv", "vp9_vaapi"],
+        ("INTEL", "av1") => vec!["av1_qsv", "av1_vaapi"],
+        ("NVIDIA", "h264") => vec!["h264_nvenc"],
+        ("NVIDIA", "h265") => vec!["hevc_nvenc"],
+        ("NVIDIA", "av1") => vec!["av1_nvenc"],
+        _ => vec![],
+    }
+}
+fn compiled_encoders(ffmpeg: &Path) -> Vec<String> {
+    let Ok(output) = Command::new(ffmpeg)
+        .args(["-hide_banner", "-encoders"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(1).map(str::to_string))
+        .collect()
+}
+fn selected_video_encoder(ffmpeg: &Path, codec: &str, backend: &str) -> Option<String> {
+    if backend == "CPU" || codec == "copy" {
+        return None;
+    }
+    let available = compiled_encoders(ffmpeg);
+    gpu_encoder_candidates(codec, backend)
+        .into_iter()
+        .find(|candidate| available.iter().any(|item| item == candidate))
+        .map(str::to_string)
+}
 fn native_audio(container: &str, s: &Settings) -> bool {
     s.use_ytdlp_audio_conversion && (container == "mp3" || (s.embed_metadata && container == "m4a"))
 }
@@ -558,7 +596,8 @@ fn run_download(urls: Vec<String>, opts: Options, tx: Sender<Event>) {
         let native_v =
             opts.mode == "video" && opts.video_codec == "copy" && opts.audio_codec == "copy";
         let ytdlp_can_embed_thumbnail = opts.settings.embed_metadata
-            && (opts.mode == "video" || matches!(opts.container.as_str(), "mp3" | "m4a"));
+            && ((opts.mode == "video" && matches!(opts.container.as_str(), "mp4" | "mkv" | "mov"))
+                || matches!(opts.container.as_str(), "mp3" | "m4a"));
         if opts.settings.embed_metadata && opts.mode != "thumbnail" {
             args.extend(["--embed-metadata".into(), "--embed-chapters".into()]);
             if ytdlp_can_embed_thumbnail {
@@ -626,7 +665,7 @@ fn run_download(urls: Vec<String>, opts: Options, tx: Sender<Event>) {
             .args(&ytdlp[1..])
             .args(&args)
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .stdin(Stdio::null())
             .spawn();
         let mut paths = Vec::new();
@@ -638,6 +677,16 @@ fn run_download(urls: Vec<String>, opts: Options, tx: Sender<Event>) {
                 continue;
             }
         };
+        let stderr = child.stderr.take().map(|err| {
+            let tx = tx.clone();
+            thread::spawn(move || {
+                for line in BufReader::new(err).lines().flatten() {
+                    if !line.trim().is_empty() {
+                        let _ = tx.send(Event::Log(line));
+                    }
+                }
+            })
+        });
         if let Some(stdout) = child.stdout.take() {
             let destination = Regex::new(r"Destination:\s+(.*)").unwrap();
             let merging = Regex::new(r#"Merging formats into\s*(?:"([^"]+)"|(.+))"#).unwrap();
@@ -666,6 +715,9 @@ fn run_download(urls: Vec<String>, opts: Options, tx: Sender<Event>) {
             }
         }
         let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
+        if let Some(handle) = stderr {
+            let _ = handle.join();
+        }
         let only_unavailable = !errors.is_empty()
             && opts.settings.download_playlist
             && errors.iter().all(|e| unavailable_error(e));
@@ -776,7 +828,7 @@ fn convert(
         "{}.temp",
         dst.extension().and_then(|x| x.to_str()).unwrap_or("out")
     ));
-    let mut c = Command::new(ff);
+    let mut c = Command::new(&ff);
     c.args(["-y", "-nostdin", "-i"]).arg(src);
     if let Some(t) = thumb.as_ref() {
         if (opts.mode == "audio"
@@ -819,7 +871,11 @@ fn convert(
             "0",
             "-sn",
         ])
-        .args(video_codec_args(&opts.video_codec))
+        .args(
+            selected_video_encoder(&ff, &opts.video_codec, &opts.settings.encoder_backend)
+                .map(|encoder| vec!["-c:v".into(), encoder])
+                .unwrap_or_else(|| video_codec_args(&opts.video_codec)),
+        )
         .args(audio_codec_for(&opts.container, &opts.audio_codec));
         if opts.settings.embed_metadata {
             c.args(["-map_chapters", "0"]);
