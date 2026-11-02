@@ -2,7 +2,7 @@ Project was made by bkbenken123
 
 # YouTube Downloader
 
-A lightweight desktop YouTube downloader built with **Python**, **yt-dlp**, **FFmpeg**, and **Tkinter**. Download videos, extract audio, or save thumbnails through a simple graphical interface.
+A lightweight desktop YouTube downloader built with **Rust**, **yt-dlp**, and **FFmpeg**. Download videos, extract audio, or save thumbnails through a simple graphical interface.
 
 ---
 
@@ -18,7 +18,7 @@ A lightweight desktop YouTube downloader built with **Python**, **yt-dlp**, **FF
 
 ## Requirements
 
-* Python 3.10 or newer
+* Rust 1.99 or newer
 * yt-dlp
 * FFmpeg
 * FFprobe
@@ -29,11 +29,13 @@ A lightweight desktop YouTube downloader built with **Python**, **yt-dlp**, **FF
 
 Clone the repository
 
-Run the application:
+Build and run the application:
 
 ```bash
-python downloader.py
+cargo run --release
 ```
+
+The application keeps using `binaries/ffmpeg`, `binaries/ffmpeg-build`, `binaries/yt-dlp`, `binaries/yt-dlp_linux`, `config.json`, and the system `PATH` for tool discovery. The bundled yt-dlp source checkout is supported when a `python3` or `python` executable is available; a standalone yt-dlp executable is preferred.
 
 ---
 
